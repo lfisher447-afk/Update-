@@ -25,13 +25,11 @@ const OmegaShield = (() => {
    const BLOCKED_RE = /\b(popup|popunder|overlay|interstitial|takeover|adhesion|leaderboard|advert|advertisement|adsense|adservice|adsystem|gpt\.js|show_ads|banner_ads|rich-media|sponsor(?:ed)?[-_](?:content|post|link)|exit.?intent|push.?notif|cookie.?consent.?banner)\b/i;
    const AD_SIG_RE  = /\b(popup|overlay|banner|sponsor|ad-container|ad-banner|ads-wrapper|ad-unit|advert|adsbox|ad-slot|gpt-ad|dfp-ad|affiliate|sponsored|tracking)\b/i;
 
-   /* Block by domain match */
    function isDomainBlocked(url) {
       try { const h = new URL(String(url)).hostname.replace(/^www\./, ''); return BLOCKED_DOMAINS.some(d => h === d || h.endsWith('.' + d)); }
       catch (_) { return BLOCKED_DOMAINS.some(d => String(url).includes(d)); }
    }
 
-   /* Detect ad/overlay nodes by signature, z-index, positioning */
    function isAdNode(node) {
       if (!node || node.nodeType !== 1) return false;
       if (node.id?.includes('bingebox') || node.id?.includes('bb-')) return false;
@@ -49,7 +47,6 @@ const OmegaShield = (() => {
       return false;
    }
 
-   /* Patch fetch */
    function patchFetch() {
       const _orig = window.fetch;
       window.fetch = function (...args) {
@@ -61,7 +58,6 @@ const OmegaShield = (() => {
       };
    }
 
-   /* Patch XHR */
    function patchXHR() {
       const _open = XMLHttpRequest.prototype.open;
       XMLHttpRequest.prototype.open = function (m, u, ...r) {
@@ -73,7 +69,6 @@ const OmegaShield = (() => {
       };
    }
 
-   /* Patch window.open */
    function patchWindowOpen() {
       const _orig = window.open;
       window.open = function (url, name, features) {
@@ -87,7 +82,6 @@ const OmegaShield = (() => {
       };
    }
 
-   /* Patch document.write (common ad injection vector) */
    function patchDocWrite() {
       const _write = document.write.bind(document);
       document.write = function (markup) {
@@ -99,7 +93,6 @@ const OmegaShield = (() => {
       };
    }
 
-   /* MutationObserver — remove ad nodes as they're inserted */
    function startObserver() {
       const obs = new MutationObserver(mutations => {
          for (const mut of mutations) {
@@ -116,7 +109,6 @@ const OmegaShield = (() => {
       document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', attach) : attach();
    }
 
-   /* Watch for dynamically inserted iframes pointing to ad networks */
    function watchIframes() {
       const iObs = new MutationObserver(muts => {
          for (const m of muts) {
@@ -199,7 +191,6 @@ const SafeStorage = {
    },
    remove(k) { try { localStorage.removeItem(k); } catch (_) {} },
    _prune() {
-      /* Remove oldest watch history entries to free space */
       const hist = this.get('bb_history', []);
       if (hist.length > 20) this.set('bb_history', hist.slice(0, 20));
       const cache_keys = ['bb_tmdb_cache'];
@@ -247,78 +238,23 @@ const SafeStorage = {
 
 /* ── CONFIG ────────────────────────────────────────────────────────────────── */
 const CONFIG = {
-   TMDB_BASE: '/api/v1/tmdb', // Points to the server.js proxy
+   TMDB_BASE: '/api/v1/tmdb',
    IMG_BASE: 'https://image.tmdb.org/t/p',
    IMG_W500: 'https://image.tmdb.org/t/p/w500',
    IMG_W1280: 'https://image.tmdb.org/t/p/w1280',
    IMG_ORIG: 'https://image.tmdb.org/t/p/original',
-   CACHE_TTL: 5 * 60 * 1000,        
-   CACHE_TTL_LONG: 60 * 60 * 1000,  
+   CACHE_TTL: 5 * 60 * 1000,
+   CACHE_TTL_LONG: 60 * 60 * 1000,
    MAX_CONCURRENT: 6,
    MAX_RETRIES: 3,
 };
 
-/* ── TMDB API v2 — Dedup, TTL cache, retry, request queue ──────────────────── */
-const TMDB = (() => {
-   const cache = AppState.cache;
-   const inflight = AppState.inflightRequests;
-
-   async function _raw(url, retries = CONFIG.MAX_RETRIES) {
-      for (let attempt = 0; attempt < retries; attempt++) {
-         try {
-            const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-            if (res.status === 429) {
-               const retry = parseInt(res.headers.get('Retry-After') || 2);
-               await new Promise(r => setTimeout(r, retry * 1000 * (attempt + 1)));
-               continue;
-            }
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            return await res.json();
-         } catch (err) {
-            if (attempt === retries - 1) throw err;
-            await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 500));
-         }
-      }
-   }
-
-   return {
-      async fetch(path, params = {}, ttl = CONFIG.CACHE_TTL) {
-         // Appends language param without the raw API key
-         const q = new URLSearchParams({ language: AppState.settings.language || 'en-US', ...params }).toString();
-         const cleanPath = '/' + path.replace(/^\/+/, '');
-         const url = `${CONFIG.TMDB_BASE}${cleanPath}?${q}`;
-
-         if (cache.has(url)) {
-            const entry = cache.get(url);
-            if (Date.now() - entry.ts < ttl) return entry.data;
-            cache.delete(url);
-         }
-
-         if (inflight.has(url)) return inflight.get(url);
-
-         const req = _raw(url)
-            .then(data => {
-               if (data) cache.set(url, { data, ts: Date.now() });
-               inflight.delete(url);
-               return data;
-            })
-            .catch(err => {
-               inflight.delete(url);
-               console.warn(`[TMDB] Failed: ${path}`, err.message);
-               return null;
-            });
-
-         inflight.set(url, req);
-         return req;
-      },
-
-      async fetchMulti(paths, params = {}) {
-         return Promise.all(paths.map(p => this.fetch(p, params)));
-      },
-
-      clearCache() { cache.clear(); },
-   };
-})();
+/* ═══════════════════════════════════════════════════════════════════════════
+   FIX 1: REMOVED the premature first `const TMDB` block that was here.
+   It referenced AppState before AppState was declared (TDZ crash) AND
+   was a duplicate const in strict mode (SyntaxError). Deleted entirely.
+   The correct TMDB is declared AFTER AppState & State below.
+   ═══════════════════════════════════════════════════════════════════════════ */
 
 
 /* ── APP STATE ─────────────────────────────────────────────────────────────── */
@@ -540,7 +476,11 @@ function getEmbedUrl(overrideServer = null) {
 }
 
 
-/* ── TMDB API v2 — Dedup, TTL cache, retry, request queue ──────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════
+   TMDB API v2 — Single declaration, AFTER AppState & State.
+   FIX 2: Removed `api_key: CONFIG.TMDB_KEY` — server proxy handles auth.
+   FIX 3: Added `cleanPath` normalization to prevent double-slash URLs.
+   ═══════════════════════════════════════════════════════════════════════════ */
 const TMDB = (() => {
    const cache = AppState.cache;
    const inflight = AppState.inflightRequests;
@@ -565,8 +505,11 @@ const TMDB = (() => {
 
    return {
       async fetch(path, params = {}, ttl = CONFIG.CACHE_TTL) {
-         const q = new URLSearchParams({ api_key: CONFIG.TMDB_KEY, language: AppState.settings.language || 'en-US', ...params }).toString();
-         const url = `${CONFIG.TMDB_BASE}${path}?${q}`;
+         /* FIX 2: Removed api_key — proxy handles it */
+         const q = new URLSearchParams({ language: AppState.settings.language || 'en-US', ...params }).toString();
+         /* FIX 3: cleanPath — strip leading slashes then prepend exactly one */
+         const cleanPath = '/' + path.replace(/^\/+/, '');
+         const url = `${CONFIG.TMDB_BASE}${cleanPath}?${q}`;
 
          /* TTL-aware cache check */
          if (cache.has(url)) {
@@ -878,7 +821,6 @@ const Hero = {
          wishBtn.onclick = () => toggleWishlist(item.id, item.type, item.title, item.poster || '', item.year || '');
       }
 
-      /* Update dots */
       const dots = document.querySelectorAll('.hero-dot');
       dots.forEach((d, i) => d.classList.toggle('active', i === State.get('heroIndex')));
    },
@@ -914,7 +856,6 @@ const Hero = {
       if (hero) {
          hero.addEventListener('mouseenter', () => this.stopCycle(), { passive: true });
          hero.addEventListener('mouseleave', () => this.startCycle(), { passive: true });
-         /* Touch swipe */
          hero.addEventListener('touchstart', e => {
             this._touchStart = e.touches[0].clientX;
             this._touchStartY = e.touches[0].clientY;
@@ -1011,7 +952,6 @@ const Rows = {
       const rowEl = document.getElementById(`row-${rowDef.id}`);
       if (!rowEl) return;
 
-      /* Handle special rows */
       if (rowDef.special === 'continue') {
          const cw = State.get('continueWatching');
          if (!cw.length) { rowEl.closest('.content-row')?.style.setProperty('display','none'); return; }
@@ -1058,7 +998,6 @@ const Rows = {
             <div class="row-track" id="row-${row.id}" role="list"></div>`;
          container.appendChild(rowEl);
 
-         /* Lazy-load row when visible */
          const obs = new IntersectionObserver(entries => {
             if (entries[0].isIntersecting) { obs.disconnect(); this.load(row); }
          }, { rootMargin: '200px' });
@@ -1066,7 +1005,6 @@ const Rows = {
       });
    },
 
-   /* Mouse-drag horizontal scroll */
    _initDrag(el) {
       let isDown = false, startX = 0, scrollLeft = 0;
       el.addEventListener('mousedown', e => {
@@ -1083,7 +1021,6 @@ const Rows = {
    },
 };
 
-/* Expose to HTML onclick */
 window.showCategoryFromRow = (rowId, mt, title) => {
    const row = ROWS.find(r => r.id === rowId);
    if (!row || !row.ep) return;
@@ -1101,7 +1038,11 @@ window.showCategoryFromRow = (rowId, mt, title) => {
 };
 
 
-/* ── WATCH PARTY ENGINE v3 — Reconnect, emoji, typing, timestamps ───────────── */
+/* ═══════════════════════════════════════════════════════════════════════════
+   WATCH PARTY ENGINE v3
+   FIX 5: `partyChat` → `partyMessages` in addChatMsg & addSysMsg.
+          System-message class `sys` → `party-sys-msg`.
+   ═══════════════════════════════════════════════════════════════════════════ */
 const PartyEngine = {
    ws: null,
    room: null,
@@ -1183,7 +1124,6 @@ const PartyEngine = {
       const code = Math.floor(10000000 + Math.random() * 90000000).toString();
       this.connect(code);
       vibrate('heavy');
-      /* Copy code to clipboard */
       navigator.clipboard?.writeText(code).then(() => showToast(`Party code ${code} copied!`, 'success'));
    },
 
@@ -1199,7 +1139,7 @@ const PartyEngine = {
 
    leaveRoom() {
       clearTimeout(this._reconnectTimer);
-      this._reconnectAttempts = this._maxReconnect; // prevent auto-reconnect
+      this._reconnectAttempts = this._maxReconnect;
       if (this.ws) this.ws.close();
       document.getElementById('partySidebar')?.classList.remove('open');
       this.room = null;
@@ -1254,8 +1194,9 @@ const PartyEngine = {
       }
    },
 
+   /* FIX 5: partyChat → partyMessages */
    addChatMsg(text, isSelf, user = '', ts = Date.now()) {
-      const c = document.getElementById('partyChat');
+      const c = document.getElementById('partyMessages');
       if (!c) return;
       const time = new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
       c.insertAdjacentHTML('beforeend', `
@@ -1268,10 +1209,11 @@ const PartyEngine = {
       if (!isSelf) vibrate('light');
    },
 
+   /* FIX 5: partyChat → partyMessages, class sys → party-sys-msg */
    addSysMsg(text) {
-      const c = document.getElementById('partyChat');
+      const c = document.getElementById('partyMessages');
       if (!c) return;
-      c.insertAdjacentHTML('beforeend', `<div class="party-msg sys">${esc(text)}</div>`);
+      c.insertAdjacentHTML('beforeend', `<div class="party-msg party-sys-msg">${esc(text)}</div>`);
       c.scrollTop = c.scrollHeight;
    },
 
@@ -1283,7 +1225,10 @@ const PartyEngine = {
 };
 
 
-/* ── DETAIL MODAL v2 — Cast, trailers, reviews, episode progress ─────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════
+   DETAIL MODAL v2
+   FIX 4: `getElementById('detailBody')` → `'detailModalBody'`
+   ═══════════════════════════════════════════════════════════════════════════ */
 async function openDetailModal(id, type, autoPlay = false) {
    State.set('currentId', String(id));
    State.set('currentType', type);
@@ -1291,7 +1236,8 @@ async function openDetailModal(id, type, autoPlay = false) {
    State.set('currentEpisode', 1);
    State.set('currentServer', 0);
 
-   const body = document.getElementById('detailBody');
+   /* FIX 4: detailBody → detailModalBody */
+   const body = document.getElementById('detailModalBody');
    if (!body) return;
    body.innerHTML = `<div class="detail-loading"><div class="detail-spinner"></div><span>Loading…</span></div>`;
    const overlay = document.getElementById('detailOverlay');
@@ -1319,7 +1265,6 @@ async function openDetailModal(id, type, autoPlay = false) {
       const runtime = fmtRuntime(detail.runtime || detail.episode_run_time?.[0]);
       const trailer = (videos?.results || []).find(v => v.site === 'YouTube' && (v.type === 'Trailer' || v.type === 'Teaser'));
 
-      /* Cast cards */
       const cast = (credits?.cast || []).slice(0, 12);
       const castHTML = cast.length && AppState.settings.showCastSection ? `
          <div class="cast-section">
@@ -1336,7 +1281,6 @@ async function openDetailModal(id, type, autoPlay = false) {
             </div>
          </div>` : '';
 
-      /* Similar cards */
       const simCards = (similar?.results || []).slice(0, 8).map(s => norm(s, type)).filter(Boolean).map(s => `
          <article class="sim-card" onclick="openDetailModal('${s.id}','${s.type}',false)">
             ${s.poster ? `<img class="sim-card-img" src="${s.poster}" loading="lazy">` : '<div class="sim-card-img sim-no-img"><i class="fas fa-film"></i></div>'}
@@ -1347,7 +1291,6 @@ async function openDetailModal(id, type, autoPlay = false) {
             </div>
          </article>`).join('');
 
-      /* Content rating */
       const ratings = detail.release_dates?.results || detail.content_ratings?.results || [];
       const usRating = ratings.find(r => r.iso_3166_1 === 'US');
       const contentRating = usRating?.release_dates?.[0]?.certification || usRating?.rating || '';
@@ -1472,7 +1415,6 @@ function switchServerTo(idx) {
    if (iframe?.src) iframe.src = getEmbedUrl();
    const nameEl = document.getElementById('serverName');
    if (nameEl) nameEl.textContent = SERVERS[idx]?.name || '';
-   /* Update picker active state */
    document.querySelectorAll('.server-option').forEach((el, i) => el.classList.toggle('active', i === idx));
    document.getElementById('serverPickerDropdown').style.display = 'none';
    showToast(`Switched to ${SERVERS[idx]?.name}`);
@@ -1490,7 +1432,6 @@ function nextEpisode() {
    State.set('currentEpisode', ep + 1);
    startPlaying();
    showToast(`Playing S${season}E${ep + 1}`);
-   /* Update active ep card */
    document.querySelectorAll('.ep-card').forEach(c => {
       const epNum = parseInt(c.dataset.ep);
       c.classList.toggle('ep-active', epNum === ep + 1);
@@ -1572,7 +1513,7 @@ function _updateContinueWatching() {
 }
 
 
-/* ── SEARCH ENGINE v2 — AbortController, trending, recent history ───────────── */
+/* ── SEARCH ENGINE v2 ───────────────────────────────────────────────────────── */
 const Search = (() => {
    let _debounce = null, _sugDebounce = null, _abortCtrl = null;
 
@@ -1800,7 +1741,6 @@ function toggleWishlist(id, type, title, poster, year) {
       Achievements.check();
    }
    State.set('wishlist', wishlist); State.persist(); refreshWishlistUI();
-   /* Update detail modal button */
    const db = document.getElementById('detailListBtn');
    if (db && State.get('currentId') === String(id)) {
       db.classList.toggle('in-list', added);
@@ -1907,19 +1847,16 @@ function _trackStats(type, genres) {
    if (type === 'movie') stats.movies++;
    else stats.episodes++;
 
-   /* Weekly activity heatmap (0=Sun) */
    const day = new Date().getDay();
    if (!Array.isArray(stats.weeklyActivity)) stats.weeklyActivity = Array(7).fill(0);
    stats.weeklyActivity[day] = (stats.weeklyActivity[day] || 0) + 1;
 
-   /* Genre tracking */
    genres.forEach(g => { stats.topGenres[g.name] = (stats.topGenres[g.name] || 0) + 1; });
 
-   /* Streak */
    const today = new Date().toDateString();
    const last = stats.lastWatchDate;
    if (last === today) {
-      /* same day — no change */
+      /* same day */
    } else if (last === new Date(Date.now() - 86400000).toDateString()) {
       stats.streak = (stats.streak || 0) + 1;
       stats.longestStreak = Math.max(stats.longestStreak || 0, stats.streak);
@@ -1957,7 +1894,8 @@ const Achievements = {
       if (!t) return;
       t.className = 'toast show achievement-toast';
       t.style.borderColor = color;
-      t.innerHTML = `<span class="achievement-icon">${def.icon}</span><div><strong>Achievement Unlocked!</strong><br><span style="color:${color}">${def.name}</span> — ${def.desc}</div>`;
+      t.innerHTML = `<span class="achievement-icon">${def.icon}</span><div><strong>Achievement Unlocked!</strong>
+<span style="color:${color}">${def.name}</span> — ${def.desc}</div>`;
       clearTimeout(t._timer);
       t._timer = setTimeout(() => t.classList.remove('show'), 5000);
       vibrate('heavy');
@@ -2015,7 +1953,6 @@ function refreshSettingsUI() {
    if (hapticEl) hapticEl.value = s.hapticIntensity || 50;
    const srvEl = document.getElementById('set-server');
    if (srvEl) srvEl.innerHTML = SERVERS.map((srv, i) => `<option value="${i}" ${State.get('currentServer')===i?'selected':''}>${srv.badge} ${srv.name}</option>`).join('');
-   /* Stats summary */
    const stats = AppState.stats;
    const summaryEl = document.getElementById('statsSummaryText');
    if (summaryEl) summaryEl.innerHTML = `<strong>${stats.movies}</strong> movies • <strong>${stats.episodes}</strong> episodes • <strong>${(stats.hoursWatched||0).toFixed(1)}h</strong> watched • <strong>${stats.streak||0}</strong> day streak`;
@@ -2088,7 +2025,6 @@ function renderStatsChart() {
          }
       });
 
-      /* Genre donut chart if data exists */
       const gCtx = document.getElementById('genreChart');
       if (gCtx && Object.keys(stats.topGenres || {}).length) {
          if (window._genreChart) window._genreChart.destroy();
@@ -2196,7 +2132,6 @@ function activateKonami() {
    showToast('⚡ GOD MODE UNLOCKED — You found the secret!', 'success', 5000);
    vibrate('heavy');
    Achievements.check();
-   /* Visual burst */
    const burst = document.createElement('div');
    burst.id = 'konamiBurst';
    burst.innerHTML = Array.from({length:20},()=>`<div class="konami-particle" style="--dx:${(Math.random()-0.5)*400}px;--dy:${(Math.random()-0.5)*400}px;--r:${Math.random()*720}deg"></div>`).join('');
@@ -2235,21 +2170,49 @@ function showKeyboardShortcuts() {
 }
 
 
-/* ── BOOT SEQUENCE ──────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════
+   BOOT SEQUENCE
+   FIX 6: Escape key — null guards on partyModal and serverPickerDropdown.
+   FIX 7: Loader failsafe 3s → 10s + countdown with skip button.
+   ═══════════════════════════════════════════════════════════════════════════ */
 async function init() {
    /* Apply theme immediately */
    document.documentElement.setAttribute('data-theme', AppState.settings.theme || 'netflix');
    if (AppState.settings.reducedMotion) document.documentElement.classList.add('reduced-motion');
    if (AppState.settings.autoTheme) _autoTheme();
 
-   const hideLoader = () => { document.getElementById('loaderOverlay')?.classList.add('hidden'); };
-   const failsafe = setTimeout(hideLoader, 3000);
+   const hideLoader = () => {
+      const lo = document.getElementById('loaderOverlay');
+      if (lo) lo.classList.add('hidden');
+      clearInterval(countdownInterval);
+   };
+
+   /* FIX 7: 10s failsafe with live countdown + skip button */
+   let countdown = 10;
+   const failsafe = setTimeout(hideLoader, 10000);
+   const loaderOverlay = document.getElementById('loaderOverlay');
+   let countdownInterval;
+   if (loaderOverlay) {
+      const countdownEl = document.createElement('div');
+      countdownEl.id = 'loaderCountdown';
+      countdownEl.style.cssText = 'position:absolute;bottom:32px;left:50%;transform:translateX(-50%);text-align:center;color:#aaa;font-size:14px;z-index:100001;';
+      countdownEl.innerHTML = `<span id="loaderCountdownText">Loading… ${countdown}s</span><br><button id="loaderSkipBtn" style="margin-top:8px;padding:4px 16px;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:6px;cursor:pointer;font-size:13px;">✕ Skip</button>`;
+      loaderOverlay.appendChild(countdownEl);
+      document.getElementById('loaderSkipBtn')?.addEventListener('click', () => {
+         clearTimeout(failsafe);
+         hideLoader();
+      });
+      countdownInterval = setInterval(() => {
+         countdown--;
+         const txt = document.getElementById('loaderCountdownText');
+         if (txt) txt.textContent = `Loading… ${countdown}s`;
+         if (countdown <= 0) clearInterval(countdownInterval);
+      }, 1000);
+   }
 
    try {
-      /* Boot profile screen first */
       showProfiles();
 
-      /* Parallel load: genres + hero */
       const [genreMovies, genreTV] = await Promise.all([
          TMDB.fetch('/genre/movie/list', {}, CONFIG.CACHE_TTL_LONG),
          TMDB.fetch('/genre/tv/list',    {}, CONFIG.CACHE_TTL_LONG),
@@ -2259,7 +2222,6 @@ async function init() {
          buildGenrePills();
       }
 
-      /* Build UI systems */
       Hero.load();
       Rows.buildAll();
       refreshWishlistUI();
@@ -2278,7 +2240,6 @@ async function init() {
             if (AppState.konamiIndex === AppState.konamiCode.length) { activateKonami(); AppState.konamiIndex = 0; }
          } else { AppState.konamiIndex = 0; }
 
-         /* Skip shortcuts inside text inputs */
          const tag = document.activeElement?.tagName;
          const inInput = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
          if (!inInput) {
@@ -2292,28 +2253,790 @@ async function init() {
             if (e.key === 'ArrowLeft')  { Hero.prev(); Hero.restartCycle(); }
             if (e.key === 'ArrowRight') { Hero.next(); Hero.restartCycle(); }
          }
+
+         /* FIX 6: Null guards on Escape key targets */
          if (e.key === 'Escape') {
             closeDetailModal();
             closeSettings();
             closeWishlistPanel();
             Search.close();
-            document.getElementById('partyModal').style.display = 'none';
-            document.getElementById('serverPickerDropdown').style.display = 'none';
+            const _pm = document.getElementById('partyModal');
+            if (_pm) _pm.style.display = 'none';
+            const _spd = document.getElementById('serverPickerDropdown');
+            if (_spd) _spd.style.display = 'none';
             document.getElementById('shortcutsModal')?.remove();
          }
       });
 
-      /* Back button handling */
       window.addEventListener('popstate', e => { if (!e.state || e.state.view !== 'modal') closeDetailModal(); });
 
-      /* Deep-link handler: #type/id */
       const hash = window.location.hash.slice(1);
       if (/^(movie|tv)\/\d+$/.test(hash)) {
          const [type, id] = hash.split('/');
          EventBus.once('profile:selected', () => openDetailModal(id, type, false));
       }
 
-      /* Periodic streak check */
+      setInterval(Achievements.check.bind(Achievements), 60000);
+
+   } catch (err) {
+      console.error('[BingeBox] Init error:', err);
+   } finally {
+      clearTimeout(failsafe);
+      hideLoader();
+   }
+}
+
+
+/* ── GLOBAL FUNCTION EXPORTS ────────────────────────────────────────────────── */
+Object.assign(window, {
+   openDetailModal, closeDetailModal, startPlaying, switchServer, switchServerTo, openServerPicker,
+   loadEpisodes, playEpisode, nextEpisode, goFullscreen,
+   toggleWishlist, toggleWishlistPanel, openWishlistPanel, closeWishlistPanel, switchPanelTab,
+   showCategory, filterByGenre, goHome, loadMore, toggleInfiniteScroll,
+   showToast, updateActiveNav, showContextMenu, buildGenrePills,
+   openSettings, closeSettings, switchSettingsTab, toggleSetting, applyTheme,
+   saveSettings, exportData, importData, clearAllData, testHaptic,
+   showProfiles, selectProfile, promptAddProfile,
+   startVoiceSearch, activateKonami, scrollToHistory, shareMedia,
+   showKeyboardShortcuts,
+   PartyEngine, Navbar, Hero, Rows, Search, Achievements, TMDB, EventBus, State, AppState,
+});
+
+/* ── LAUNCH ─────────────────────────────────────────────────────────────────── */
+init();  <span>${esc(q)}</span>
+               <button class="suggest-remove" onclick="event.stopPropagation();Search._removeRecent('${esc(q)}')">✕</button>
+            </div>`).join('')}
+         <div class="suggest-footer" onclick="Search._clearRecent()">Clear history</div>`;
+      sug.classList.add('active');
+   }
+
+   function _saveRecentSearch(q) {
+      let recent = AppState.recentSearches.filter(r => r !== q);
+      recent.unshift(q);
+      AppState.recentSearches = recent.slice(0, 10);
+      SafeStorage.set('bb_recent_searches', AppState.recentSearches);
+   }
+
+   function onKeydown(e) {
+      const q = e.target.value.trim();
+      if (e.key === 'Enter' && q) {
+         clearTimeout(_debounce);
+         hideSugg();
+         _saveRecentSearch(q);
+         State.set('searchQuery', q);
+         State.set('searchPage', 1);
+         doSearch();
+         return;
+      }
+      if (e.key === 'Escape') { close(); return; }
+      if (!q) { hideSugg(); if (document.getElementById('pageResults')?.classList.contains('active')) goHome(); return; }
+      clearTimeout(_sugDebounce);
+      _sugDebounce = setTimeout(() => loadSugg(q), 250);
+      if (q.length >= 3) {
+         clearTimeout(_debounce);
+         _debounce = setTimeout(() => { State.set('searchQuery', q); State.set('searchPage', 1); doSearch(); }, 550);
+      }
+   }
+
+   async function loadSugg(q) {
+      _abortCtrl?.abort();
+      _abortCtrl = new AbortController();
+      const sug = document.getElementById('searchSuggestions');
+      if (!sug) return;
+      const data = await TMDB.fetch('/search/multi', { query: q, page: 1 });
+      if (!data) return;
+      const results = (data.results || []).filter(r => (r.media_type === 'movie' || r.media_type === 'tv') && r.poster_path).slice(0, 6);
+      if (!results.length) { hideSugg(); return; }
+      sug.innerHTML = results.map(r => {
+         const item = norm(r, r.media_type);
+         return `<div class="suggest-item" onclick="openDetailModal('${item.id}','${item.type}',false);Search.close()">
+            <img class="suggest-poster" src="${item.poster_sm || item.poster}" loading="lazy" alt="">
+            <div class="suggest-info">
+               <p class="suggest-title">${esc(item.title)}</p>
+               <p class="suggest-meta">${item.type.toUpperCase()} • ${item.year || ''} • ★ ${item.rating || 'N/A'}</p>
+            </div>
+         </div>`;
+      }).join('') + `<div class="suggest-footer" onclick="Search.triggerFull('${esc(q)}')">See all results for "${esc(q)}"</div>`;
+      sug.classList.add('active');
+   }
+
+   async function doSearch() {
+      const q = State.get('searchQuery');
+      if (!q) return;
+      showResultsPanel(`Results for "<span>${esc(q)}</span>"`);
+      const grid = document.getElementById('searchResultsGrid');
+      if (State.get('searchPage') === 1 && grid) grid.innerHTML = '<div class="results-loading"><div class="detail-spinner"></div></div>';
+      const data = await TMDB.fetch('/search/multi', { query: q, page: State.get('searchPage') });
+      const results = (data?.results || []).filter(r => r.media_type === 'movie' || r.media_type === 'tv');
+      if (!results.length && State.get('searchPage') === 1) {
+         if (grid) grid.innerHTML = `<div class="no-results"><i class="fas fa-search"></i><p>No results for "${esc(q)}"</p><p class="no-results-hint">Try a different spelling or search term.</p></div>`;
+         return;
+      }
+      const cards = results.map(r => gridCard(norm(r, r.media_type))).join('');
+      if (State.get('searchPage') === 1 && grid) grid.innerHTML = cards;
+      else grid?.insertAdjacentHTML('beforeend', cards);
+      const lmBtn = document.getElementById('loadMoreBtn');
+      if (lmBtn) lmBtn.style.display = data && data.page < data.total_pages ? 'flex' : 'none';
+   }
+
+   function triggerFull(q) {
+      document.getElementById('searchInput').value = q;
+      State.set('searchQuery', q); State.set('searchPage', 1);
+      _saveRecentSearch(q);
+      hideSugg();
+      doSearch();
+   }
+
+   return {
+      open, close, toggle, onKeydown, doSearch, hideSuggestions: hideSugg, triggerFull,
+      _removeRecent(q) { AppState.recentSearches = AppState.recentSearches.filter(r => r !== q); SafeStorage.set('bb_recent_searches', AppState.recentSearches); _showRecentSearches(); },
+      _clearRecent() { AppState.recentSearches = []; SafeStorage.set('bb_recent_searches', []); hideSugg(); },
+   };
+})();
+window.Search = Search;
+
+
+/* ── GRID CARD ──────────────────────────────────────────────────────────────── */
+function gridCard(item) {
+   if (!item) return '';
+   const q = qualityLabel({ vote_average: item.rating, vote_count: item.votes, release_date: item.year+'-01-01' }, item.type);
+   return `<article class="grid-card" onclick="openDetailModal('${esc(item.id)}','${item.type}',false)" tabindex="0" role="button" aria-label="${esc(item.title)}">
+      ${item.poster
+         ? `<img src="${item.poster}" loading="lazy" alt="${esc(item.title)}" decoding="async">`
+         : `<div class="grid-card-no-img"><i class="fas fa-film"></i></div>`}
+      <div class="grid-card-body">
+         <p class="grid-card-title">${esc(item.title)}</p>
+         <div class="grid-card-meta">
+            <span class="match">${matchPct(item.rating)}%</span>
+            <span>${item.year || ''}</span>
+            <span class="type-badge">${item.type.toUpperCase()}</span>
+            <span class="media-quality ${q.cls}" style="font-size:.6rem;padding:1px 5px">${q.label}</span>
+         </div>
+      </div>
+   </article>`;
+}
+
+function showResultsPanel(title) {
+   document.getElementById('pageHome').style.display = 'none';
+   document.getElementById('pageResults')?.classList.add('active');
+   const titleEl = document.getElementById('resultsTitle');
+   if (titleEl) titleEl.innerHTML = title;
+   window.scrollTo({ top: 0, behavior: 'smooth' });
+   updateActiveNav('');
+}
+
+function goHome() {
+   document.getElementById('pageHome').style.display = '';
+   document.getElementById('pageResults')?.classList.remove('active');
+   document.getElementById('searchInput').value = '';
+   State.set('searchQuery', ''); State.set('currentCategory', ''); State.set('currentGenreId', null);
+   updateActiveNav('nav-home');
+   window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+
+/* ── CATEGORY / GENRE BROWSE ────────────────────────────────────────────────── */
+async function showCategory(type, cat) {
+   State.set('currentCategoryType', type); State.set('currentCategory', cat); State.set('currentGenreId', null); State.set('filterPage', 1);
+   showResultsPanel(`${type==='movie'?'Movies':'TV Shows'} — ${cat.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase())}`);
+   const grid = document.getElementById('searchResultsGrid');
+   grid.innerHTML = '<div class="results-loading"><div class="detail-spinner"></div></div>';
+   const data = await TMDB.fetch(`/${type}/${cat}`, { page: 1 });
+   if (!data?.results) { grid.innerHTML = '<p class="no-results">Failed to load</p>'; return; }
+   grid.innerHTML = data.results.map(i => gridCard(norm(i, type))).join('');
+   const lmBtn = document.getElementById('loadMoreBtn');
+   if (lmBtn) lmBtn.style.display = data.page < data.total_pages ? 'flex' : 'none';
+   updateActiveNav('');
+}
+
+async function filterByGenre(gid, gname) {
+   if (!gid) return;
+   State.set('currentGenreId', gid); State.set('currentCategoryType', 'movie'); State.set('currentCategory', ''); State.set('filterPage', 1);
+   showResultsPanel(`<i class="fas fa-film"></i> ${esc(gname)}`);
+   const grid = document.getElementById('searchResultsGrid');
+   grid.innerHTML = '<div class="results-loading"><div class="detail-spinner"></div></div>';
+   const data = await TMDB.fetch('/discover/movie', { with_genres: gid, page: 1, sort_by: 'popularity.desc' });
+   if (!data?.results) { grid.innerHTML = '<p class="no-results">Failed to load</p>'; return; }
+   grid.innerHTML = data.results.map(i => gridCard(norm(i, 'movie'))).join('');
+   const lmBtn = document.getElementById('loadMoreBtn');
+   if (lmBtn) lmBtn.style.display = data.page < data.total_pages ? 'flex' : 'none';
+}
+
+async function loadMore() {
+   if (State.get('isFetchingMore')) return;
+   State.set('isFetchingMore', true);
+   const lmBtn = document.getElementById('loadMoreBtn');
+   if (lmBtn) lmBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading…';
+   const q = State.get('searchQuery'), cat = State.get('currentCategory'), gid = State.get('currentGenreId'), type = State.get('currentCategoryType');
+   const page = State.get('filterPage') + 1; State.set('filterPage', page);
+   const grid = document.getElementById('searchResultsGrid');
+   let data;
+   try {
+      if (q) { State.set('searchPage', State.get('searchPage') + 1); data = await TMDB.fetch('/search/multi', { query: q, page: State.get('searchPage') }); grid.insertAdjacentHTML('beforeend', (data?.results||[]).filter(r=>r.media_type==='movie'||r.media_type==='tv').map(r=>gridCard(norm(r,r.media_type))).join('')); }
+      else if (gid) { data = await TMDB.fetch('/discover/movie', { with_genres: gid, page, sort_by: 'popularity.desc' }); grid.insertAdjacentHTML('beforeend', (data?.results||[]).map(i=>gridCard(norm(i,'movie'))).join('')); }
+      else if (cat) { data = await TMDB.fetch(`/${type}/${cat}`, { page }); grid.insertAdjacentHTML('beforeend', (data?.results||[]).map(i=>gridCard(norm(i,type))).join('')); }
+   } finally {
+      if (lmBtn) { lmBtn.innerHTML = 'Load More'; lmBtn.style.display = data && data.page < data.total_pages ? 'flex' : 'none'; }
+      State.set('isFetchingMore', false);
+   }
+}
+
+function updateActiveNav(id) {
+   document.querySelectorAll('.nav-link').forEach(a => a.classList.remove('active'));
+   if (id) document.getElementById(id)?.classList.add('active');
+}
+
+
+/* ── WISHLIST & HISTORY v2 ─────────────────────────────────────────────────── */
+function toggleWishlist(id, type, title, poster, year) {
+   const wishlist = State.get('wishlist');
+   const idx = wishlist.findIndex(w => w.id === String(id));
+   let added;
+   if (idx > -1) {
+      wishlist.splice(idx, 1); added = false;
+      showToast(`Removed "${title}" from My List`, 'info');
+   } else {
+      wishlist.unshift({ id: String(id), type, title, poster, year, addedAt: Date.now(), notes: '' });
+      added = true;
+      showToast(`Added "${title}" to My List`);
+      Achievements.check();
+   }
+   State.set('wishlist', wishlist); State.persist(); refreshWishlistUI();
+   const db = document.getElementById('detailListBtn');
+   if (db && State.get('currentId') === String(id)) {
+      db.classList.toggle('in-list', added);
+      const icon = db.querySelector('i');
+      if (icon) { icon.className = `fas ${added?'fa-check':'fa-plus'}`; }
+   }
+   EventBus.emit('wishlist:changed', { id, added });
+}
+
+function refreshWishlistUI() {
+   const list = document.getElementById('wishlistItems');
+   const empty = document.getElementById('wishlistEmpty');
+   const wl = State.get('wishlist');
+   if (!list) return;
+   if (!wl.length) { list.innerHTML = ''; if (empty) empty.style.display = 'block'; return; }
+   if (empty) empty.style.display = 'none';
+   list.innerHTML = wl.map(item => `
+      <div class="wishlist-item" onclick="closeWishlistPanel();openDetailModal('${item.id}','${item.type}',false)">
+         ${item.poster ? `<img class="wishlist-poster" src="${item.poster}" loading="lazy">` : '<div class="wishlist-poster wishlist-poster-empty"><i class="fas fa-film"></i></div>'}
+         <div class="wishlist-info">
+            <p class="wishlist-title">${esc(item.title)}</p>
+            <p class="wishlist-meta">${item.type.toUpperCase()} • ${item.year || ''}</p>
+            <p class="wishlist-added">${relTime(item.addedAt)}</p>
+         </div>
+         <div class="wishlist-actions">
+            <button class="wl-play-btn" onclick="event.stopPropagation();closeWishlistPanel();openDetailModal('${item.id}','${item.type}',true)" aria-label="Play"><i class="fas fa-play"></i></button>
+            <button class="wl-remove-btn" onclick="event.stopPropagation();toggleWishlist('${item.id}','${item.type}','${esc(item.title)}','${item.poster||''}','${item.year||''}')" aria-label="Remove"><i class="fas fa-trash"></i></button>
+         </div>
+      </div>`).join('');
+}
+
+function toggleWishlistPanel() { const p = document.getElementById('wishlistPanel'); p?.classList.contains('open') ? closeWishlistPanel() : openWishlistPanel(); }
+function openWishlistPanel()  { refreshWishlistUI(); document.getElementById('wishlistPanel')?.classList.add('open'); refreshHistoryUI(); }
+function closeWishlistPanel() { document.getElementById('wishlistPanel')?.classList.remove('open'); }
+
+function switchPanelTab(tab, btn) {
+   document.querySelectorAll('.panel-tab').forEach(b => b.classList.remove('active'));
+   if (btn) btn.classList.add('active');
+   document.getElementById('panelWishlist').style.display = tab === 'wishlist' ? '' : 'none';
+   document.getElementById('panelHistory').style.display  = tab === 'history'  ? '' : 'none';
+   if (tab === 'history') refreshHistoryUI();
+}
+
+function addToHistory(id, type, title, poster, year) {
+   const hist = State.get('watchHistory').filter(h => h.id !== String(id));
+   hist.unshift({ id: String(id), type, title, poster, year, watchedAt: Date.now() });
+   State.set('watchHistory', hist.slice(0, 150));
+   State.persist();
+   refreshHistoryUI();
+   renderHomeHistory();
+}
+
+function refreshHistoryUI() {
+   const list = document.getElementById('historyItems');
+   const hist = State.get('watchHistory');
+   if (!list) return;
+   if (!hist.length) { list.innerHTML = '<p class="history-empty">No watch history yet.</p>'; return; }
+   list.innerHTML = hist.slice(0, 30).map(item => `
+      <div class="history-item" onclick="closeWishlistPanel();openDetailModal('${item.id}','${item.type}',false)">
+         ${item.poster ? `<img class="history-poster" src="${item.poster}" loading="lazy">` : ''}
+         <div>
+            <p class="history-title">${esc(item.title)}</p>
+            <p class="history-meta">${item.type.toUpperCase()} • ${relTime(item.watchedAt)}</p>
+         </div>
+         <button class="history-remove-btn" onclick="event.stopPropagation();_removeHistory('${item.id}')" aria-label="Remove"><i class="fas fa-times"></i></button>
+      </div>`).join('');
+}
+
+function _removeHistory(id) {
+   State.set('watchHistory', State.get('watchHistory').filter(h => h.id !== String(id)));
+   State.persist(); refreshHistoryUI(); renderHomeHistory();
+}
+
+function renderHomeHistory() {
+   const hist = State.get('watchHistory');
+   const sec = document.getElementById('historySection');
+   const row = document.getElementById('homeHistoryRow');
+   if (!sec || !row) return;
+   if (!hist.length) { sec.style.display = 'none'; return; }
+   sec.style.display = '';
+   row.innerHTML = hist.slice(0, 12).map(item => `
+      <div onclick="openDetailModal('${item.id}','${item.type}',false)" class="home-history-card">
+         ${item.poster ? `<img src="${item.poster}" alt="${esc(item.title)}">` : '<div class="home-history-placeholder"><i class="fas fa-film"></i></div>'}
+         <div class="home-history-overlay"><p>${esc(item.title)}</p></div>
+      </div>`).join('');
+}
+
+function scrollToHistory() { document.getElementById('historySection')?.scrollIntoView({ behavior: 'smooth' }); }
+
+
+/* ── SHARE MEDIA ────────────────────────────────────────────────────────────── */
+async function shareMedia(title, id, type) {
+   const url = `${window.location.origin}${window.location.pathname}#${type}/${id}`;
+   if (navigator.share) {
+      try { await navigator.share({ title: `Watch ${title} on BingeBox`, url }); return; } catch (_) {}
+   }
+   navigator.clipboard?.writeText(url).then(() => showToast('Link copied to clipboard!', 'success'));
+}
+
+
+/* ── STATS TRACKING ─────────────────────────────────────────────────────────── */
+function _trackStats(type, genres) {
+   const stats = AppState.stats;
+   if (type === 'movie') stats.movies++;
+   else stats.episodes++;
+
+   const day = new Date().getDay();
+   if (!Array.isArray(stats.weeklyActivity)) stats.weeklyActivity = Array(7).fill(0);
+   stats.weeklyActivity[day] = (stats.weeklyActivity[day] || 0) + 1;
+
+   genres.forEach(g => { stats.topGenres[g.name] = (stats.topGenres[g.name] || 0) + 1; });
+
+   const today = new Date().toDateString();
+   const last = stats.lastWatchDate;
+   if (last === today) {
+      /* same day */
+   } else if (last === new Date(Date.now() - 86400000).toDateString()) {
+      stats.streak = (stats.streak || 0) + 1;
+      stats.longestStreak = Math.max(stats.longestStreak || 0, stats.streak);
+   } else {
+      stats.streak = 1;
+   }
+   stats.lastWatchDate = today;
+
+   SafeStorage.set('bb_stats', stats);
+   Achievements.check();
+}
+
+
+/* ── ACHIEVEMENTS SYSTEM ────────────────────────────────────────────────────── */
+const Achievements = {
+   check() {
+      const stats = AppState.stats;
+      const wl = State.get('wishlist');
+      ACHIEVEMENTS_DEF.forEach(def => {
+         if (AppState.achievements[def.id]) return;
+         try {
+            if (def.req(stats, wl)) {
+               AppState.achievements[def.id] = { unlockedAt: Date.now() };
+               SafeStorage.set('bb_achievements', AppState.achievements);
+               this._notify(def);
+            }
+         } catch (_) {}
+      });
+   },
+
+   _notify(def) {
+      const rarityColors = { common: '#9ca3af', uncommon: '#22c55e', rare: '#3b82f6', epic: '#a855f7', legendary: '#f59e0b' };
+      const color = rarityColors[def.rarity] || '#fff';
+      const t = document.getElementById('toast');
+      if (!t) return;
+      t.className = 'toast show achievement-toast';
+      t.style.borderColor = color;
+      t.innerHTML = `<span class="achievement-icon">${def.icon}</span><div><strong>Achievement Unlocked!</strong>
+<span style="color:${color}">${def.name}</span> — ${def.desc}</div>`;
+      clearTimeout(t._timer);
+      t._timer = setTimeout(() => t.classList.remove('show'), 5000);
+      vibrate('heavy');
+   },
+
+   getAll() {
+      return ACHIEVEMENTS_DEF.map(def => ({ ...def, unlocked: !!AppState.achievements[def.id], unlockedAt: AppState.achievements[def.id]?.unlockedAt || null }));
+   },
+
+   renderPanel() {
+      const container = document.getElementById('achievementsGrid');
+      if (!container) return;
+      const all = this.getAll();
+      const rarityOrder = { legendary: 0, epic: 1, rare: 2, uncommon: 3, common: 4 };
+      all.sort((a, b) => (a.unlocked === b.unlocked ? rarityOrder[a.rarity] - rarityOrder[b.rarity] : a.unlocked ? -1 : 1));
+      container.innerHTML = all.map(a => `
+         <div class="achievement-card ${a.unlocked ? 'unlocked' : 'locked'} rarity-${a.rarity}">
+            <div class="achievement-icon-wrap">${a.icon}</div>
+            <div class="achievement-info">
+               <p class="achievement-name">${a.unlocked ? a.name : '???'}</p>
+               <p class="achievement-desc">${a.unlocked ? a.desc : 'Keep watching to unlock'}</p>
+               <span class="achievement-rarity">${a.rarity}</span>
+            </div>
+            ${a.unlocked ? `<div class="achievement-check"><i class="fas fa-check-circle"></i></div>` : '<div class="achievement-lock"><i class="fas fa-lock"></i></div>'}
+         </div>`).join('');
+   },
+};
+
+
+/* ── SETTINGS ENGINE v2 ─────────────────────────────────────────────────────── */
+function openSettings(tab = 'appearance') {
+   const modal = document.getElementById('settingsModal');
+   if (!modal) return;
+   refreshSettingsUI();
+   switchSettingsTab(tab, document.querySelector(`.set-tab-btn[data-tab="${tab}"]`) || document.querySelector('.set-tab-btn'));
+   modal.classList.add('active');
+}
+function closeSettings() { document.getElementById('settingsModal')?.classList.remove('active'); }
+
+function switchSettingsTab(tab, btn) {
+   document.querySelectorAll('.set-tab').forEach(el => el.classList.remove('active'));
+   document.querySelectorAll('.set-tab-btn').forEach(el => el.classList.remove('active'));
+   document.getElementById(`set-tab-${tab}`)?.classList.add('active');
+   if (btn) btn.classList.add('active');
+   if (tab === 'data') renderStatsChart();
+   if (tab === 'achievements') Achievements.renderPanel();
+}
+
+function refreshSettingsUI() {
+   const s = AppState.settings;
+   ['ambientGlow','cinemaDim','privacyMode','bandwidthSaver','autoPlayNext','showCastSection','reducedMotion','notificationsEnabled','autoTheme']
+      .forEach(k => document.getElementById(`tog-${k}`)?.classList.toggle('on', !!s[k]));
+   document.querySelectorAll('.theme-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.theme === s.theme));
+   const hapticEl = document.getElementById('set-haptic');
+   if (hapticEl) hapticEl.value = s.hapticIntensity || 50;
+   const srvEl = document.getElementById('set-server');
+   if (srvEl) srvEl.innerHTML = SERVERS.map((srv, i) => `<option value="${i}" ${State.get('currentServer')===i?'selected':''}>${srv.badge} ${srv.name}</option>`).join('');
+   const stats = AppState.stats;
+   const summaryEl = document.getElementById('statsSummaryText');
+   if (summaryEl) summaryEl.innerHTML = `<strong>${stats.movies}</strong> movies • <strong>${stats.episodes}</strong> episodes • <strong>${(stats.hoursWatched||0).toFixed(1)}h</strong> watched • <strong>${stats.streak||0}</strong> day streak`;
+}
+
+function toggleSetting(key) {
+   AppState.settings[key] = !AppState.settings[key];
+   document.getElementById(`tog-${key}`)?.classList.toggle('on', AppState.settings[key]);
+   if (key === 'reducedMotion') document.documentElement.classList.toggle('reduced-motion', AppState.settings[key]);
+}
+
+function applyTheme(theme, btn) {
+   document.documentElement.setAttribute('data-theme', theme);
+   AppState.settings.theme = theme;
+   document.querySelectorAll('.theme-btn').forEach(b => b.classList.remove('active'));
+   if (btn) btn.classList.add('active');
+   showToast(`Theme: ${theme.toUpperCase()}`);
+}
+
+function testHaptic() {
+   AppState.settings.hapticIntensity = parseInt(document.getElementById('set-haptic')?.value || 50);
+   vibrate('heavy');
+   showToast(`Haptic: ${AppState.settings.hapticIntensity}%`, 'info');
+}
+
+function saveSettings() {
+   const srvEl = document.getElementById('set-server');
+   if (srvEl) State.set('currentServer', parseInt(srvEl.value));
+   const tkEl = document.getElementById('set-tmdb');
+   if (tkEl?.value.trim()) { CONFIG.TMDB_KEY = tkEl.value.trim(); SafeStorage.set('bb_tmdb_key', CONFIG.TMDB_KEY); TMDB.clearCache(); }
+   if (AppState.settings.autoTheme) _autoTheme();
+   SafeStorage.set('bb_settings', AppState.settings);
+   closeSettings();
+   showToast('Settings saved.', 'success');
+}
+
+function _autoTheme() {
+   const h = new Date().getHours();
+   const theme = h >= 6 && h < 20 ? 'netflix' : 'midnight';
+   applyTheme(theme, null);
+}
+
+function renderStatsChart() {
+   setTimeout(() => {
+      const ctx = document.getElementById('statsChart');
+      if (!ctx || !window.Chart) return;
+      if (window._statsChart) window._statsChart.destroy();
+      const stats = AppState.stats;
+      const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+      const weekly = Array.isArray(stats.weeklyActivity) ? stats.weeklyActivity : Array(7).fill(0);
+      window._statsChart = new Chart(ctx, {
+         type: 'bar',
+         data: {
+            labels: days,
+            datasets: [{
+               label: 'Activity',
+               data: weekly,
+               backgroundColor: weekly.map((_, i) => i === new Date().getDay() ? 'rgba(229,9,20,.85)' : 'rgba(255,255,255,.15)'),
+               borderColor: weekly.map((_, i) => i === new Date().getDay() ? '#E50914' : 'rgba(255,255,255,.3)'),
+               borderWidth: 1, borderRadius: 6,
+            }]
+         },
+         options: {
+            responsive: true, maintainAspectRatio: false,
+            scales: {
+               y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,.05)' }, ticks: { color: '#888', stepSize: 1 } },
+               x: { grid: { display: false }, ticks: { color: '#888' } }
+            },
+            plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ` ${ctx.raw} watch${ctx.raw !== 1 ? 'es' : ''}` } } }
+         }
+      });
+
+      const gCtx = document.getElementById('genreChart');
+      if (gCtx && Object.keys(stats.topGenres || {}).length) {
+         if (window._genreChart) window._genreChart.destroy();
+         const genres = Object.entries(stats.topGenres).sort((a, b) => b[1] - a[1]).slice(0, 6);
+         const palette = ['#E50914','#3b82f6','#22c55e','#f59e0b','#a855f7','#06b6d4'];
+         window._genreChart = new Chart(gCtx, {
+            type: 'doughnut',
+            data: { labels: genres.map(g => g[0]), datasets: [{ data: genres.map(g => g[1]), backgroundColor: palette, borderWidth: 0 }] },
+            options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right', labels: { color: '#ccc', font: { size: 11 } } } } }
+         });
+      }
+   }, 80);
+}
+
+function exportData() { SafeStorage.export(); }
+function importData(file) { SafeStorage.import(file); }
+function clearAllData() {
+   if (!confirm('Clear ALL watch history, lists, stats, and settings? This is permanent.')) return;
+   ['bb_lib','bb_stats','bb_wishlist','bb_history','bb_achievements','bb_ep_progress','bb_continue','bb_notifs','bb_recent_searches'].forEach(k => localStorage.removeItem(k));
+   showToast('All data cleared. Reloading…', 'warning');
+   setTimeout(() => location.reload(), 1500);
+}
+
+
+/* ── CONTEXT MENU ───────────────────────────────────────────────────────────── */
+function showContextMenu(e, id, type, data) {
+   e.preventDefault(); vibrate('light');
+   const cm = document.getElementById('context-menu');
+   if (!cm) return;
+   cm.style.display = 'block';
+   cm.style.left = `${Math.min(e.pageX, window.innerWidth - 240)}px`;
+   cm.style.top  = `${Math.min(e.pageY, window.innerHeight - 220)}px`;
+   const item = (() => { try { return JSON.parse(decodeURIComponent(data)); } catch { return {}; } })();
+   const title = item.title || item.name || '';
+   const poster = item.poster_path ? `${CONFIG.IMG_W500}${item.poster_path}` : '';
+   const year = (item.release_date || item.first_air_date || '').slice(0, 4);
+   cm.querySelector('#cm-play')?.addEventListener('click', () => { cm.style.display = 'none'; openDetailModal(id, type, true); }, { once: true });
+   cm.querySelector('#cm-watchlist')?.addEventListener('click', () => { cm.style.display = 'none'; toggleWishlist(id, type, title, poster, year); }, { once: true });
+   cm.querySelector('#cm-share')?.addEventListener('click', () => { cm.style.display = 'none'; shareMedia(title, id, type); }, { once: true });
+   cm.querySelector('#cm-info')?.addEventListener('click', () => { cm.style.display = 'none'; openDetailModal(id, type, false); }, { once: true });
+}
+
+
+/* ── GENRE PILLS ────────────────────────────────────────────────────────────── */
+function buildGenrePills() {
+   const genres = [
+      {id:28,name:'Action'},{id:35,name:'Comedy'},{id:27,name:'Horror'},{id:878,name:'Sci-Fi'},
+      {id:10749,name:'Romance'},{id:53,name:'Thriller'},{id:16,name:'Animation'},{id:99,name:'Documentary'},
+      {id:18,name:'Drama'},{id:10765,name:'Fantasy'},{id:9648,name:'Mystery'},{id:80,name:'Crime'},
+      {id:36,name:'History'},{id:10752,name:'War'},{id:37,name:'Western'},
+   ];
+   const bar = document.getElementById('genrePillsBar');
+   if (bar) bar.innerHTML = genres.map(g => `<button class="genre-pill-btn" onclick="filterByGenre(${g.id},'${esc(g.name)}')">${esc(g.name)}</button>`).join('');
+   const dd = document.getElementById('genreDropdown');
+   if (dd) dd.innerHTML = genres.map(g => `<div class="genre-drop-item" onclick="filterByGenre(${g.id},'${esc(g.name)}')">${esc(g.name)}</div>`).join('');
+}
+
+
+/* ── INFINITE SCROLL ─────────────────────────────────────────────────────────── */
+function setupInfiniteScroll() {
+   const sentinel = document.getElementById('infiniteScrollSentinel');
+   if (!sentinel) return;
+   new IntersectionObserver(entries => {
+      if (entries[0].isIntersecting && State.get('infiniteScrollOn') && !State.get('isFetchingMore')) loadMore();
+   }, { rootMargin: '300px' }).observe(sentinel);
+}
+
+function toggleInfiniteScroll() {
+   const on = State.toggle('infiniteScrollOn');
+   const btn = document.getElementById('infiniteScrollBtn');
+   if (btn) { btn.textContent = on ? '⚡ Auto-Load: ON' : '🔄 Auto-Load: OFF'; btn.classList.toggle('active', on); }
+   showToast(on ? 'Auto-load enabled' : 'Auto-load disabled', 'info');
+}
+
+
+/* ── VOICE SEARCH ───────────────────────────────────────────────────────────── */
+function startVoiceSearch() {
+   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+   if (!SR) { showToast('Voice search not supported in this browser.', 'error'); return; }
+   const rec = new SR();
+   rec.lang = AppState.settings.language || 'en-US';
+   rec.interimResults = false;
+   rec.maxAlternatives = 1;
+   rec.onstart = () => { showToast('🎙️ Listening…', 'info'); vibrate('medium'); };
+   rec.onresult = e => {
+      const txt = e.results[0][0].transcript.trim();
+      showToast(`Searching: "${txt}"`, 'info');
+      State.set('searchQuery', txt);
+      const inp = document.getElementById('searchInput');
+      if (inp) inp.value = txt;
+      Search.open();
+      Search.doSearch();
+   };
+   rec.onerror = err => showToast(`Voice error: ${err.error}`, 'error');
+   rec.start();
+}
+
+
+/* ── KONAMI CODE ────────────────────────────────────────────────────────────── */
+function activateKonami() {
+   AppState._konami = true;
+   document.documentElement.setAttribute('data-theme', 'godmode');
+   AppState.settings.theme = 'godmode';
+   SafeStorage.set('bb_settings', AppState.settings);
+   showToast('⚡ GOD MODE UNLOCKED — You found the secret!', 'success', 5000);
+   vibrate('heavy');
+   Achievements.check();
+   const burst = document.createElement('div');
+   burst.id = 'konamiBurst';
+   burst.innerHTML = Array.from({length:20},()=>`<div class="konami-particle" style="--dx:${(Math.random()-0.5)*400}px;--dy:${(Math.random()-0.5)*400}px;--r:${Math.random()*720}deg"></div>`).join('');
+   document.body.appendChild(burst);
+   setTimeout(() => burst.remove(), 2000);
+}
+
+
+/* ── KEYBOARD SHORTCUTS ─────────────────────────────────────────────────────── */
+function showKeyboardShortcuts() {
+   const shortcuts = [
+      { key: '/', action: 'Open Search' },
+      { key: 'Esc', action: 'Close modal / Search' },
+      { key: 'F', action: 'Toggle Cinema Mode' },
+      { key: 'M', action: 'Toggle My List panel' },
+      { key: 'H', action: 'Go Home' },
+      { key: 'S', action: 'Open Settings' },
+      { key: 'N', action: 'Next episode (in player)' },
+      { key: 'ArrowLeft / Right', action: 'Hero carousel' },
+      { key: '↑↑↓↓←→←→BA', action: '🕹️ Konami Code' },
+   ];
+   const existing = document.getElementById('shortcutsModal');
+   if (existing) { existing.remove(); return; }
+   const modal = document.createElement('div');
+   modal.id = 'shortcutsModal';
+   modal.className = 'shortcuts-modal';
+   modal.innerHTML = `
+      <div class="shortcuts-box">
+         <div class="shortcuts-header"><h3>⌨️ Keyboard Shortcuts</h3><button onclick="this.closest('#shortcutsModal').remove()"><i class="fas fa-times"></i></button></div>
+         <div class="shortcuts-list">
+            ${shortcuts.map(s => `<div class="shortcut-row"><kbd>${esc(s.key)}</kbd><span>${esc(s.action)}</span></div>`).join('')}
+         </div>
+      </div>`;
+   modal.onclick = e => { if (e.target === modal) modal.remove(); };
+   document.body.appendChild(modal);
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   BOOT SEQUENCE
+   FIX 6: Escape key — null guards on partyModal and serverPickerDropdown.
+   FIX 7: Loader failsafe 3s → 10s + countdown with skip button.
+   ═══════════════════════════════════════════════════════════════════════════ */
+async function init() {
+   /* Apply theme immediately */
+   document.documentElement.setAttribute('data-theme', AppState.settings.theme || 'netflix');
+   if (AppState.settings.reducedMotion) document.documentElement.classList.add('reduced-motion');
+   if (AppState.settings.autoTheme) _autoTheme();
+
+   const hideLoader = () => {
+      const lo = document.getElementById('loaderOverlay');
+      if (lo) lo.classList.add('hidden');
+      clearInterval(countdownInterval);
+   };
+
+   /* FIX 7: 10s failsafe with live countdown + skip button */
+   let countdown = 10;
+   const failsafe = setTimeout(hideLoader, 10000);
+   const loaderOverlay = document.getElementById('loaderOverlay');
+   let countdownInterval;
+   if (loaderOverlay) {
+      const countdownEl = document.createElement('div');
+      countdownEl.id = 'loaderCountdown';
+      countdownEl.style.cssText = 'position:absolute;bottom:32px;left:50%;transform:translateX(-50%);text-align:center;color:#aaa;font-size:14px;z-index:100001;';
+      countdownEl.innerHTML = `<span id="loaderCountdownText">Loading… ${countdown}s</span><br><button id="loaderSkipBtn" style="margin-top:8px;padding:4px 16px;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:6px;cursor:pointer;font-size:13px;">✕ Skip</button>`;
+      loaderOverlay.appendChild(countdownEl);
+      document.getElementById('loaderSkipBtn')?.addEventListener('click', () => {
+         clearTimeout(failsafe);
+         hideLoader();
+      });
+      countdownInterval = setInterval(() => {
+         countdown--;
+         const txt = document.getElementById('loaderCountdownText');
+         if (txt) txt.textContent = `Loading… ${countdown}s`;
+         if (countdown <= 0) clearInterval(countdownInterval);
+      }, 1000);
+   }
+
+   try {
+      showProfiles();
+
+      const [genreMovies, genreTV] = await Promise.all([
+         TMDB.fetch('/genre/movie/list', {}, CONFIG.CACHE_TTL_LONG),
+         TMDB.fetch('/genre/tv/list',    {}, CONFIG.CACHE_TTL_LONG),
+      ]);
+      if (genreMovies || genreTV) {
+         [...(genreMovies?.genres || []), ...(genreTV?.genres || [])].forEach(g => { GENRE_MAP[g.id] = g.name; });
+         buildGenrePills();
+      }
+
+      Hero.load();
+      Rows.buildAll();
+      refreshWishlistUI();
+      refreshHistoryUI();
+      renderHomeHistory();
+      setupInfiniteScroll();
+      Navbar.init();
+      PartyEngine.renderReactionBar?.();
+      Achievements.check();
+
+      /* Keyboard listeners */
+      document.addEventListener('keydown', e => {
+         /* Konami */
+         if (e.key === AppState.konamiCode[AppState.konamiIndex]) {
+            AppState.konamiIndex++;
+            if (AppState.konamiIndex === AppState.konamiCode.length) { activateKonami(); AppState.konamiIndex = 0; }
+         } else { AppState.konamiIndex = 0; }
+
+         const tag = document.activeElement?.tagName;
+         const inInput = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+         if (!inInput) {
+            if (e.key === '/') { e.preventDefault(); Search.open(); }
+            if (e.key === 'f' || e.key === 'F') { if (document.getElementById('playerSection')?.style.display !== 'none') goFullscreen(); }
+            if (e.key === 'm' || e.key === 'M') toggleWishlistPanel();
+            if (e.key === 'h' || e.key === 'H') goHome();
+            if (e.key === 's' || e.key === 'S') openSettings();
+            if (e.key === 'n' || e.key === 'N') { if (State.get('currentType') === 'tv') nextEpisode(); }
+            if (e.key === '?') showKeyboardShortcuts();
+            if (e.key === 'ArrowLeft')  { Hero.prev(); Hero.restartCycle(); }
+            if (e.key === 'ArrowRight') { Hero.next(); Hero.restartCycle(); }
+         }
+
+         /* FIX 6: Null guards on Escape key targets */
+         if (e.key === 'Escape') {
+            closeDetailModal();
+            closeSettings();
+            closeWishlistPanel();
+            Search.close();
+            const _pm = document.getElementById('partyModal');
+            if (_pm) _pm.style.display = 'none';
+            const _spd = document.getElementById('serverPickerDropdown');
+            if (_spd) _spd.style.display = 'none';
+            document.getElementById('shortcutsModal')?.remove();
+         }
+      });
+
+      window.addEventListener('popstate', e => { if (!e.state || e.state.view !== 'modal') closeDetailModal(); });
+
+      const hash = window.location.hash.slice(1);
+      if (/^(movie|tv)\/\d+$/.test(hash)) {
+         const [type, id] = hash.split('/');
+         EventBus.once('profile:selected', () => openDetailModal(id, type, false));
+      }
+
       setInterval(Achievements.check.bind(Achievements), 60000);
 
    } catch (err) {
