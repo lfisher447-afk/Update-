@@ -2217,7 +2217,43 @@
     <div class="loader-logo">BingeBox <span style="font-size:.6em;opacity:.6;">Ω</span></div>
     <div class="loader-bar-wrap"><div class="loader-bar"></div></div>
     <p class="loader-sub">Initializing OmegaShield</p>
+    <button id="loaderSkipBtn" style="margin-top:16px;padding:8px 24px;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.3);border-radius:8px;color:#fff;cursor:pointer;font-family:inherit;font-size:.8rem;letter-spacing:.05em;transition:background .2s ease;">✕ Skip (10s)</button>
   </div>
+  <!-- ── Loader Failsafe ──────────────────────────────
+       Runs independently of bingebox_omega_v3.js.
+       Guarantees the loader can always be dismissed even
+       if the main engine crashes, stalls, or never loads.
+  ──────────────────────────────────────────────────── -->
+  <script>
+    (function () {
+      var _skipTimer    = null;
+      var _skipInterval = null;
+
+      function hideLoader() {
+        clearTimeout(_skipTimer);
+        clearInterval(_skipInterval);
+        var overlay = document.getElementById('loaderOverlay');
+        if (overlay) overlay.classList.add('hidden');
+      }
+
+      var time = 10;
+      var btn  = document.getElementById('loaderSkipBtn');
+
+      _skipInterval = setInterval(function () {
+        time--;
+        if (btn) btn.textContent = '✕ Skip (' + time + 's)';
+        if (time <= 0) hideLoader();
+      }, 1000);
+
+      _skipTimer = setTimeout(hideLoader, 10000);
+
+      if (btn) btn.onclick = hideLoader;
+
+      /* Expose so main app engine can call window._hideLoader() on
+         successful boot, clearing these timers cleanly. */
+      window._hideLoader = hideLoader;
+    })();
+  </script>
 
 
   <!-- ═══════════════════════════════════════════════════
@@ -2858,44 +2894,58 @@
   <!-- ═══════════════════════════════════════════════════
        POST-LOAD: Wire hero buttons after Hero is defined
   ═══════════════════════════════════════════════════ -->
-  <script>
-    /* Hero action button wiring after bingebox loaded */
-    (function() {
+<script>
+    /* Hero action button wiring — DOMContentLoaded guarantees all elements
+       and the external bingebox script are fully ready before wiring begins. */
+    document.addEventListener('DOMContentLoaded', function () {
       if (typeof Hero === 'undefined') return;
 
-      Hero._playHero = function() {
-        const item = window._currentHeroItem;
+      Hero._playHero = function () {
+        var item = window._currentHeroItem;
         if (!item) return;
         openDetailModal(item.id, item.type, true);
       };
-      Hero._infoHero = function() {
-        const item = window._currentHeroItem;
+      Hero._infoHero = function () {
+        var item = window._currentHeroItem;
         if (!item) return;
         openDetailModal(item.id, item.type, false);
       };
-      Hero._listHero = function() {
-        const item = window._currentHeroItem;
+      Hero._listHero = function () {
+        var item = window._currentHeroItem;
         if (!item) return;
         toggleWishlist(item.id, item.type, item.title, item.poster || '', item.year || '');
       };
 
-      /* Patch Hero.render to also update our backdrop hook */
-      const _origRender = Hero.render.bind(Hero);
-      Hero.render = function(item) {
+      /* Patch Hero.render:
+         1. Runs the original render (which targets .hero-badge — the FIRST
+            badge element, incorrectly overwriting "Trending #1").
+         2. Immediately corrects it using the strict ID selector.
+         3. Fires the full backdrop / title / rating hook.               */
+      var _origRender = Hero.render.bind(Hero);
+      Hero.render = function (item) {
         _origRender(item);
+
+        /* Fix: override the clobbered badge with the correct ID target */
+        if (item) {
+          var badgeType = document.getElementById('heroBadgeType');
+          if (badgeType) badgeType.textContent = (item.type || 'movie').toUpperCase();
+        }
+
         if (item && window._heroRenderHook) window._heroRenderHook(item);
       };
 
       /* Wire party reaction bar */
       if (typeof PartyEngine !== 'undefined') {
-        const bar = document.getElementById('partyReactionBar');
+        var bar = document.getElementById('partyReactionBar');
         if (bar) {
-          bar.innerHTML = PartyEngine.reactions.map(emoji =>
-            `<button class="party-reaction-btn" onclick="PartyEngine.sendReaction('${emoji}')">${emoji}</button>`
-          ).join('');
+          bar.innerHTML = PartyEngine.reactions.map(function (emoji) {
+            return '<button class="party-reaction-btn" onclick="PartyEngine.sendReaction(\'' + emoji + '\')">' + emoji + '</button>';
+          }).join('');
         }
       }
-    })();
+    });
+  </script>
+
   </script>
 
 </body>
