@@ -2361,7 +2361,6 @@
         autocomplete="off"
         spellcheck="false"
         aria-label="Search content"
-        oninput="Search.onInput(event)"
         onkeydown="Search.onKeydown(event)"
       />
       <button class="search-voice-btn" onclick="startVoiceSearch()" aria-label="Voice search" title="Voice search">
@@ -3344,6 +3343,9 @@
 
        return {
           async fetch(path, params = {}, ttl = CONFIG.CACHE_TTL) {
+             // Inject user's custom API key if they saved one in settings
+             if (AppState.settings.tmdbKey) params.api_key = AppState.settings.tmdbKey;
+             
              const q = new URLSearchParams({ language: AppState.settings.language || 'en-US', ...params }).toString();
              const cleanPath = '/' + path.replace(/^\/+/, '');
              const url = `${CONFIG.TMDB_BASE}${cleanPath}?${q}`;
@@ -3628,9 +3630,9 @@
              : '';
           const badge = el.querySelector('#heroBadgeType');
           const match = el.querySelector('.hero-match');
-          const title = el.querySelector('.hero-title');
-          const desc  = el.querySelector('.hero-desc');
-          const genres = el.querySelector('.hero-genres');
+          const title = el.querySelector('#heroTitle');
+          const desc  = el.querySelector('#heroDesc');
+          const genres = el.querySelector('#heroGenres');
           if (badge) badge.textContent = item.type === 'tv' ? 'SERIES' : 'FILM';
           if (match) match.textContent = `${matchPct(item.rating)}% Match`;
           if (title) title.textContent = item.title;
@@ -4451,7 +4453,196 @@
 
 
     /* ── BOOT SEQUENCE ──────────────────────────────────────────────────────────── */
-    async function init() {
+    
+
+/* ── UI CONTROLLERS & MISSING FUNCTIONS ── */
+    
+    function goHome() {
+       document.getElementById('pageResults').classList.remove('active');
+       document.getElementById('pageHome').style.display = 'block';
+       window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    function showResultsPanel(titleHTML) {
+       document.getElementById('pageHome').style.display = 'none';
+       const res = document.getElementById('pageResults');
+       res.classList.add('active');
+       document.getElementById('resultsTitle').innerHTML = titleHTML;
+       window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    // Wishlist Panel Logic
+    function toggleWishlistPanel() { document.getElementById('wishlistPanel').classList.toggle('open'); }
+    function openWishlistPanel()   { document.getElementById('wishlistPanel').classList.add('open'); }
+    function closeWishlistPanel()  { document.getElementById('wishlistPanel').classList.remove('open'); }
+    function switchPanelTab(tab, btn) {
+       document.querySelectorAll('.panel-tab').forEach(b => b.classList.remove('active'));
+       btn.classList.add('active');
+       document.getElementById('panelWishlist').style.display = tab === 'wishlist' ? 'block' : 'none';
+       document.getElementById('panelHistory').style.display = tab === 'history' ? 'block' : 'none';
+    }
+
+    // Wishlist & History Data
+    function toggleWishlist(id, type, title, poster, year) {
+       let wl = State.get('wishlist');
+       const exists = wl.some(w => w.id === String(id));
+       if (exists) {
+          wl = wl.filter(w => w.id !== String(id));
+          showToast('Removed from My List', 'info');
+       } else {
+          wl.unshift({ id: String(id), type, title, poster, year, added: Date.now() });
+          showToast('Added to My List', 'success');
+       }
+       State.set('wishlist', wl);
+       State.persist();
+       refreshWishlistUI();
+    }
+
+    function addToHistory(id, type, title, poster, year) {
+       let hist = State.get('watchHistory').filter(h => h.id !== String(id));
+       hist.unshift({ id: String(id), type, title, poster, year, watchedAt: Date.now() });
+       State.set('watchHistory', hist.slice(0, 50)); // Keep last 50
+       State.persist();
+       refreshHistoryUI();
+       renderHomeHistory();
+    }
+
+    function refreshWishlistUI() {
+       const wl = State.get('wishlist');
+       const container = document.getElementById('wishlistItems');
+       const empty = document.getElementById('wishlistEmpty');
+       if (!container) return;
+       if (!wl.length) { container.innerHTML = ''; empty.style.display = 'block'; return; }
+       empty.style.display = 'none';
+       container.innerHTML = wl.map(w => `
+          <div class="wishlist-item" onclick="openDetailModal('${w.id}','${w.type}',false)">
+             ${w.poster ? `<img class="wishlist-poster" src="${w.poster}">` : `<div class="wishlist-poster-empty"><i class="fas fa-film"></i></div>`}
+             <div class="wishlist-info">
+                <div class="wishlist-title">${esc(w.title)}</div>
+                <div class="wishlist-meta">${w.year || ''} • ${w.type.toUpperCase()}</div>
+             </div>
+             <div class="wishlist-actions">
+                <button class="wl-play-btn" onclick="event.stopPropagation();openDetailModal('${w.id}','${w.type}',true)"><i class="fas fa-play"></i></button>
+                <button class="wl-remove-btn" onclick="event.stopPropagation();toggleWishlist('${w.id}','${w.type}')"><i class="fas fa-trash"></i></button>
+             </div>
+          </div>
+       `).join('');
+    }
+
+    function refreshHistoryUI() {
+       const hist = State.get('watchHistory');
+       const container = document.getElementById('historyItems');
+       if (!container) return;
+       if (!hist.length) { container.innerHTML = '<div class="history-empty">No watch history yet.</div>'; return; }
+       container.innerHTML = hist.map(h => `
+          <div class="history-item" onclick="openDetailModal('${h.id}','${h.type}',false)">
+             ${h.poster ? `<img class="history-poster" src="${h.poster}">` : `<div class="wishlist-poster-empty"><i class="fas fa-film"></i></div>`}
+             <div class="wishlist-info">
+                <div class="history-title">${esc(h.title)}</div>
+                <div class="history-meta">Watched ${relTime(h.watchedAt)}</div>
+             </div>
+          </div>
+       `).join('');
+    }
+
+    function renderHomeHistory() {
+       const hist = State.get('watchHistory');
+       const section = document.getElementById('historySection');
+       const row = document.getElementById('homeHistoryRow');
+       if (!section || !row) return;
+       if (!hist.length) { section.style.display = 'none'; return; }
+       section.style.display = 'block';
+       row.innerHTML = hist.slice(0, 10).map(h => `
+          <div class="home-history-card" onclick="openDetailModal('${h.id}','${h.type}',false)">
+             ${h.poster ? `<img src="${h.poster}">` : `<div class="home-history-placeholder"><i class="fas fa-film"></i></div>`}
+             <div class="home-history-overlay"><p>${esc(h.title)}</p></div>
+          </div>
+       `).join('');
+    }
+
+    // Grid Card Generator (Used by Search and Category Browse)
+    function gridCard(item) {
+       if (!item) return '';
+       return `
+          <article class="grid-card" onclick="openDetailModal('${item.id}','${item.type}',false)">
+             ${item.poster ? `<img src="${item.poster}" loading="lazy">` : `<div class="grid-card-no-img"><i class="fas fa-film"></i></div>`}
+             <div class="grid-card-body">
+                <div class="grid-card-title">${esc(item.title)}</div>
+                <div class="grid-card-meta">
+                   <span class="match">${matchPct(item.rating)}% Match</span>
+                   <span class="type-badge">${item.type.toUpperCase()}</span>
+                   <span>${item.year || ''}</span>
+                </div>
+             </div>
+          </article>
+       `;
+    }
+
+    // Settings UI
+    function openSettings(tab = 'appearance') {
+       document.getElementById('settingsModal').classList.add('active');
+       document.getElementById('set-tmdb').value = AppState.settings.tmdbKey || '';
+       switchSettingsTab(tab, document.querySelector(`.set-tab-btn[data-tab="${tab}"]`));
+    }
+    
+    function closeSettings() { document.getElementById('settingsModal').classList.remove('active'); }
+
+    function switchSettingsTab(tabId, btn) {
+       if (btn) {
+          document.querySelectorAll('.set-tab-btn').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+       }
+       document.querySelectorAll('.set-tab').forEach(t => t.classList.remove('active'));
+       document.getElementById(`set-tab-${tabId}`).classList.add('active');
+    }
+
+    function applyTheme(themeName, btn) {
+       document.documentElement.setAttribute('data-theme', themeName);
+       if (btn) {
+          document.querySelectorAll('.theme-btn').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+       }
+    }
+
+    function saveSettings() {
+       // Save custom API key
+       const tmdbKey = document.getElementById('set-tmdb').value.trim();
+       AppState.settings.tmdbKey = tmdbKey || null;
+
+       // Save Theme
+       const activeThemeBtn = document.querySelector('.theme-btn.active');
+       if (activeThemeBtn) AppState.settings.theme = activeThemeBtn.dataset.theme;
+
+       SafeStorage.set('bb_settings', AppState.settings);
+       showToast('Settings saved successfully', 'success');
+       closeSettings();
+    }
+
+    function testHaptic() { vibrate('medium'); }
+    function exportData() { SafeStorage.export(); }
+    function importData(file) { if(file) SafeStorage.import(file); }
+    function clearAllData() {
+       if(confirm('Are you sure? This deletes all history, lists, and settings.')) {
+          localStorage.clear();
+          location.reload();
+       }
+    }
+
+    // Achievements Stub to prevent crash
+    const Achievements = {
+       check() { /* Add detailed achievement checks here if needed */ }
+    };
+    function _trackStats(type, genres) { /* Stub to prevent crash */ }
+    function setupInfiniteScroll() { /* Stub */ }
+    function toggleInfiniteScroll() { /* Stub */ }
+    function loadMore() { /* Stub */ }
+    function showCategory(type, ep) { /* Stub */ }
+    function buildGenrePills() { /* Stub */ }
+    function activateKonami() { 
+       document.documentElement.setAttribute('data-theme', 'godmode'); 
+       showToast('GOD MODE UNLOCKED 👑', 'success', 5000);
+    }
+async function init() {
        document.documentElement.setAttribute('data-theme', AppState.settings.theme || 'netflix');
        if (AppState.settings.reducedMotion) document.documentElement.classList.add('reduced-motion');
        if (AppState.settings.autoTheme) _autoTheme();
