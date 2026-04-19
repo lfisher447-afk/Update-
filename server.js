@@ -1,8 +1,7 @@
 'use strict';
-
 // ═══════════════════════════════════════════════════════════════════
-//  BingeBox Omega — server.js  v3.0 (Monolithic Core)
-//  Main Railway entry point.
+//  BingeBox Omega — server.js  v3.0 (Full Monolithic Core)
+//  Ultimate Cinematic Streaming Engine Backend
 // ═══════════════════════════════════════════════════════════════════
 
 const fs          = require('fs');
@@ -16,13 +15,13 @@ const cors        = require('cors');
 const compression = require('compression');
 
 // ═══════════════════════════════════════════════════════════════════
-//  1. LOGGER MODULE
+//  1. LOGGER MODULE (Advanced Ring-Buffer & File Rotation)
 // ═══════════════════════════════════════════════════════════════════
 const Logger = (() => {
   const IS_PROD   = (process.env.NODE_ENV || 'production') === 'production';
   const LOG_DIR   = process.env.LOG_DIR || path.join(process.cwd(), 'logs');
   const MIN_LEVEL = (process.env.LOG_LEVEL || (IS_PROD ? 'INFO' : 'DEBUG')).toUpperCase();
-  const RING_MAX  = 300;
+  const RING_MAX  = 300;   // entries kept in memory for the /logs API
 
   const LEVELS = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3, FATAL: 4 };
 
@@ -42,7 +41,7 @@ const Logger = (() => {
     if (depth > 5 || !obj || typeof obj !== 'object') return obj;
     if (Array.isArray(obj)) return obj.map(v => redact(v, depth + 1));
     const out = {};
-    for (const [k, v] of Object.entries(obj)) {
+    for (const[k, v] of Object.entries(obj)) {
       out[k] = SENSITIVE.has(k.toLowerCase()) ? '[REDACTED]' : redact(v, depth + 1);
     }
     return out;
@@ -63,7 +62,7 @@ const Logger = (() => {
       try { _stream?.end(); } catch (_) {}
       _day = today;
       try {
-        fs.mkdirSync(LOG_DIR, { recursive: true });
+        if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
         _stream = fs.createWriteStream(
           path.join(LOG_DIR, `bingebox-${today}.log`),
           { flags: 'a', encoding: 'utf8' }
@@ -100,6 +99,7 @@ const Logger = (() => {
     pushRing(entry);
 
     const line = JSON.stringify(entry) + '\n';
+
     if (IS_PROD) {
       process.stdout.write(line);
     } else {
@@ -115,6 +115,7 @@ const Logger = (() => {
         `${dim}[${ctx}]${reset} ${msg}${metaStr}\n`
       );
     }
+
     fileStream()?.write(line);
   }
 
@@ -125,6 +126,7 @@ const Logger = (() => {
       warn  : (msg, meta) => write('WARN',  context, msg, meta),
       error : (msg, meta) => write('ERROR', context, msg, meta),
       fatal : (msg, meta) => write('FATAL', context, msg, meta),
+
       time(label) {
         const t0 = process.hrtime.bigint();
         return (extra = {}) => {
@@ -133,6 +135,7 @@ const Logger = (() => {
           return ms;
         };
       },
+
       child(sub) { return createLogger(`${context}:${sub}`); },
     };
   }
@@ -142,19 +145,25 @@ const Logger = (() => {
   function requestLogger(options = {}) {
     const skip   = options.skip || (req => /^\/(health|favicon\.ico|robots\.txt)/.test(req.path));
     const httpLog = createLogger('HTTP');
+
     return function logRequest(req, res, next) {
       if (skip(req)) return next();
+
       const t0 = process.hrtime.bigint();
       const id = req.headers['x-request-id'] || '-';
+
       httpLog.debug(`→ ${req.method} ${req.path}`, {
-        id, ip : req.ip,
+        id,
+        ip : req.ip,
         ua : (req.headers['user-agent'] || '').slice(0, 80),
         q  : Object.keys(req.query).length ? redact(req.query) : undefined,
       });
 
       res.on('finish', () => {
         const ms    = Number(process.hrtime.bigint() - t0) / 1e6;
-        const level = res.statusCode >= 500 ? 'ERROR' : res.statusCode >= 400 ? 'WARN' : 'INFO';
+        const level = res.statusCode >= 500 ? 'ERROR'
+                    : res.statusCode >= 400 ? 'WARN'
+                    : 'INFO';
         write(level, 'HTTP', `${req.method} ${req.path} ${res.statusCode} ${ms.toFixed(0)}ms`, {
           id, status: res.statusCode,
           ms: parseFloat(ms.toFixed(2)),
@@ -162,6 +171,7 @@ const Logger = (() => {
           bytes: parseInt(res.getHeader('content-length') || '0', 10) || undefined,
         });
       });
+
       next();
     };
   }
@@ -179,157 +189,290 @@ const Logger = (() => {
     res.json({ total: ring.length, returned: slice.length, entries: slice });
   }
 
-  process.on('unhandledRejection', reason => root.error('Unhandled Promise Rejection', { reason: String(reason) }));
+  process.on('unhandledRejection', reason => {
+    root.error('Unhandled Promise Rejection', { reason: String(reason) });
+  });
   process.on('uncaughtException', err => {
-    root.fatal('Uncaught Exception', { message: err.message, stack: err.stack?.split('\n').slice(0, 4).join(' ← ') });
+    root.fatal('Uncaught Exception', {
+      message: err.message,
+      stack  : err.stack?.split('\n').slice(0, 4).join(' ← '),
+    });
     setTimeout(() => process.exit(1), 500);
   });
 
   return { createLogger, root, requestLogger, logsHandler, getBuffer: () =>[...ring] };
 })();
 
-const createLogger  = Logger.createLogger;
-const requestLogger = Logger.requestLogger;
-const logsHandler   = Logger.logsHandler;
-const log           = createLogger('Server');
+const log = Logger.createLogger('Server');
 
 
 // ═══════════════════════════════════════════════════════════════════
-//  2. CACHE MANAGER MODULE
+//  2. CACHE MANAGER (L1/L2 LRU + Zlib Compression + SWR)
 // ═══════════════════════════════════════════════════════════════════
 const CacheManager = (() => {
-  const cacheLog = createLogger('Cache');
+  const cacheLog = Logger.createLogger('Cache');
 
   const CFG = {
     L1_MAX         : 300,
     L2_MAX         : 2_000,
-    DEFAULT_TTL    : 5   * 60_000,
-    MAX_TTL        : 60  * 60_000,
-    MIN_TTL        : 30  * 1_000,
-    COMPRESS_BYTES : 4_096,
-    MEM_THRESHOLD  : 0.85,
-    SWR_WINDOW     : 30  * 1_000,
-    METRICS_RESET  : 60  * 60_000,
-    ADAPTIVE_CAP   : 8,
+    DEFAULT_TTL    : 5   * 60_000,   // 5 min
+    MAX_TTL        : 60  * 60_000,   // 60 min
+    MIN_TTL        : 30  * 1_000,    // 30 s
+    COMPRESS_BYTES : 4_096,          // compress payloads > 4 KB
+    MEM_THRESHOLD  : 0.85,           // evict L2 when RSS / total > this
+    SWR_WINDOW     : 30  * 1_000,    // serve stale for up to 30 s while refreshing
+    METRICS_RESET  : 60  * 60_000,   // reset hit counters every hour
+    ADAPTIVE_CAP   : 8,              // max hit-factor doublings for adaptive TTL
   };
 
   const m = {
     hits: 0, misses: 0, staleHits: 0, evictions: 0,
     compressions: 0, decompressions: 0, errors: 0, inflight: 0,
-    reset() { this.hits = this.misses = this.staleHits = this.evictions = this.compressions = this.decompressions = this.errors = this.inflight = 0; },
-    snapshot() { const total = this.hits + this.misses; return { ...this, hitRate: total ? +(this.hits / total).toFixed(4) : 0, total }; },
+    reset() {
+      this.hits = this.misses = this.staleHits = this.evictions =
+      this.compressions = this.decompressions = this.errors = this.inflight = 0;
+    },
+    snapshot() {
+      const total = this.hits + this.misses;
+      return { ...this, hitRate: total ? +(this.hits / total).toFixed(4) : 0, total };
+    },
   };
   setInterval(() => m.reset(), CFG.METRICS_RESET);
 
   function tryCompress(str) {
     if (!str || str.length < CFG.COMPRESS_BYTES) return { raw: str, compressed: false };
-    try { const buf = zlib.gzipSync(Buffer.from(str, 'utf8')); m.compressions++; return { raw: buf, compressed: true }; } 
-    catch (_) { return { raw: str, compressed: false }; }
+    try {
+      const buf = zlib.gzipSync(Buffer.from(str, 'utf8'));
+      m.compressions++;
+      return { raw: buf, compressed: true };
+    } catch (_) {
+      return { raw: str, compressed: false };
+    }
   }
 
   function tryDecompress(entry) {
     if (!entry.compressed) return entry.raw;
-    try { m.decompressions++; return zlib.gunzipSync(entry.raw).toString('utf8'); } 
-    catch (_) { return null; }
+    try {
+      m.decompressions++;
+      return zlib.gunzipSync(entry.raw).toString('utf8');
+    } catch (_) {
+      return null;
+    }
   }
 
   class LRUTier {
-    constructor(maxSize, name) { this._map = new Map(); this._max = maxSize; this.name = name; this.evictions = 0; }
-    _evictOldest() { const key = this._map.keys().next().value; if (key !== undefined) { this._map.delete(key); this.evictions++; m.evictions++; } }
+    constructor(maxSize, name) {
+      this._map  = new Map();
+      this._max  = maxSize;
+      this.name  = name;
+      this.evictions = 0;
+    }
+
+    _evictOldest() {
+      const key = this._map.keys().next().value;
+      if (key !== undefined) { this._map.delete(key); this.evictions++; m.evictions++; }
+    }
+
     get(key) {
       const entry = this._map.get(key);
       if (!entry) return null;
-      this._map.delete(key); this._map.set(key, entry);
-      const now = Date.now(), expired = now > entry.expires, stale = !expired && now > (entry.expires - CFG.SWR_WINDOW);
+
+      this._map.delete(key);
+      this._map.set(key, entry);
+
+      const now     = Date.now();
+      const expired = now > entry.expires;
+      const stale   = !expired && now > (entry.expires - CFG.SWR_WINDOW);
+
       if (expired && !entry.allowStale) return null;
+
       try {
-        const raw = tryDecompress(entry);
+        const raw   = tryDecompress(entry);
         if (raw === null) { this._map.delete(key); return null; }
-        return { value: JSON.parse(raw), stale: expired || stale, ttlMs: Math.max(0, entry.expires - now) };
-      } catch (_) { this._map.delete(key); return null; }
+        const value = JSON.parse(raw);
+        return { value, stale: expired || stale, ttlMs: Math.max(0, entry.expires - now) };
+      } catch (_) {
+        this._map.delete(key);
+        return null;
+      }
     }
+
     set(key, value, ttlMs, tags =[]) {
       if (this._map.size >= this._max) this._evictOldest();
-      const { raw, compressed } = tryCompress(JSON.stringify(value));
-      this._map.set(key, { raw, compressed, expires: Date.now() + ttlMs, ttlMs, tags, allowStale: true, setAt: Date.now() });
+      const serialized = JSON.stringify(value);
+      const { raw, compressed } = tryCompress(serialized);
+      this._map.set(key, {
+        raw, compressed,
+        expires   : Date.now() + ttlMs,
+        ttlMs,
+        tags,
+        allowStale: true,
+        setAt     : Date.now(),
+      });
       return true;
     }
-    delete(key) { return this._map.delete(key); }
-    clear() { const n = this._map.size; this._map.clear(); return n; }
-    get size() { return this._map.size; }
-    keys() { return[...this._map.keys()]; }
-    invalidateByTag(tag) { let n = 0; for (const [k, v] of this._map) { if (v.tags?.includes(tag)) { this._map.delete(k); n++; } } return n; }
-    info() { return { name: this.name, size: this._map.size, maxSize: this._max, evictions: this.evictions, utilization: +((this._map.size / this._max) * 100).toFixed(1) + '%' }; }
+
+    delete(key)         { return this._map.delete(key); }
+    clear()             { const n = this._map.size; this._map.clear(); return n; }
+    get size()          { return this._map.size; }
+    keys()              { return[...this._map.keys()]; }
+
+    invalidateByTag(tag) {
+      let n = 0;
+      for (const [k, v] of this._map) {
+        if (v.tags?.includes(tag)) { this._map.delete(k); n++; }
+      }
+      return n;
+    }
+
+    info() {
+      return {
+        name       : this.name,
+        size       : this._map.size,
+        maxSize    : this._max,
+        evictions  : this.evictions,
+        utilization: +((this._map.size / this._max) * 100).toFixed(1) + '%',
+      };
+    }
   }
 
-  const L1 = new LRUTier(CFG.L1_MAX, 'L1-Hot');
-  const L2 = new LRUTier(CFG.L2_MAX, 'L2-Warm');
+  const L1 = new LRUTier(CFG.L1_MAX,  'L1-Hot');
+  const L2 = new LRUTier(CFG.L2_MAX,  'L2-Warm');
+
   const _hitCount = new Map();
   setInterval(() => _hitCount.clear(), CFG.METRICS_RESET);
 
   function adaptiveTTL(key, baseTTL) {
-    const hits = (_hitCount.get(key) || 0) + 1; _hitCount.set(key, hits);
-    return Math.min(Math.max(baseTTL * Math.pow(1.3, Math.min(hits - 1, CFG.ADAPTIVE_CAP)), CFG.MIN_TTL), CFG.MAX_TTL);
+    const hits = (_hitCount.get(key) || 0) + 1;
+    _hitCount.set(key, hits);
+    return Math.min(
+      Math.max(baseTTL * Math.pow(1.3, Math.min(hits - 1, CFG.ADAPTIVE_CAP)), CFG.MIN_TTL),
+      CFG.MAX_TTL
+    );
   }
 
   function get(key) {
     const l1 = L1.get(key);
     if (l1) { m.hits++; if (l1.stale) m.staleHits++; return { ...l1, source: 'L1' }; }
+
     const l2 = L2.get(key);
-    if (l2) { m.hits++; if (l2.stale) m.staleHits++; L1.set(key, l2.value, Math.min(l2.ttlMs, CFG.DEFAULT_TTL * 2)); return { ...l2, source: 'L2' }; }
-    m.misses++; return null;
+    if (l2) {
+      m.hits++;
+      if (l2.stale) m.staleHits++;
+      L1.set(key, l2.value, Math.min(l2.ttlMs, CFG.DEFAULT_TTL * 2));
+      return { ...l2, source: 'L2' };
+    }
+
+    m.misses++;
+    return null;
   }
 
   function set(key, value, baseTTL = CFG.DEFAULT_TTL, tags =[]) {
     const ttl = adaptiveTTL(key, baseTTL);
-    L1.set(key, value, Math.min(ttl, CFG.DEFAULT_TTL * 2), tags); L2.set(key, value, ttl, tags);
+    L1.set(key, value, Math.min(ttl, CFG.DEFAULT_TTL * 2), tags);
+    L2.set(key, value, ttl, tags);
   }
 
   function del(key) { L1.delete(key); L2.delete(key); }
-  function invalidateTag(tag) { const n = L1.invalidateByTag(tag) + L2.invalidateByTag(tag); cacheLog.info(`Tag invalidation: "${tag}" — ${n} entries removed`); return n; }
+
+  function invalidateTag(tag) {
+    const n = L1.invalidateByTag(tag) + L2.invalidateByTag(tag);
+    cacheLog.info(`Tag invalidation: "${tag}" — ${n} entries removed`);
+    return n;
+  }
 
   const inflight = new Map();
+
   async function getOrFetch(key, fetcher, baseTTL = CFG.DEFAULT_TTL, tags =[]) {
     const cached = get(key);
+
     if (cached && !cached.stale) return cached.value;
+
     if (cached && cached.stale) {
       if (!inflight.has(key)) {
         m.inflight++;
-        const p = fetcher().then(fresh => { set(key, fresh, baseTTL, tags); return fresh; }).catch(err => { m.errors++; cacheLog.warn(`BG refresh failed: ${key}`, { msg: err.message }); }).finally(() => { inflight.delete(key); m.inflight--; });
+        const p = fetcher()
+          .then(fresh => { set(key, fresh, baseTTL, tags); return fresh; })
+          .catch(err  => { m.errors++; cacheLog.warn(`BG refresh failed: ${key}`, { msg: err.message }); })
+          .finally(() => { inflight.delete(key); m.inflight--; });
         inflight.set(key, p);
       }
       return cached.value;
     }
+
     if (inflight.has(key)) return inflight.get(key);
+
     m.inflight++;
-    const p = fetcher().then(fresh => { set(key, fresh, baseTTL, tags); return fresh; }).catch(err => { m.errors++; inflight.delete(key); m.inflight--; throw err; }).finally(() => { inflight.delete(key); m.inflight--; });
-    inflight.set(key, p); return p;
+    const p = fetcher()
+      .then(fresh  => { set(key, fresh, baseTTL, tags); return fresh; })
+      .catch(err   => { m.errors++; inflight.delete(key); m.inflight--; throw err; })
+      .finally(() => { inflight.delete(key); m.inflight--; });
+
+    inflight.set(key, p);
+    return p;
   }
 
-  setInterval(() => {
+  function checkMemPressure() {
     const ratio = process.memoryUsage().rss / os.totalmem();
-    if (ratio > CFG.MEM_THRESHOLD) { const evictN = Math.ceil(L2.size * 0.20); L2.keys().slice(0, evictN).forEach(k => L2.delete(k)); cacheLog.warn(`Memory pressure (${(ratio * 100).toFixed(1)}%) — evicted ${evictN} L2 entries`); }
-  }, 30_000);
+    if (ratio > CFG.MEM_THRESHOLD) {
+      const evictN = Math.ceil(L2.size * 0.20);
+      L2.keys().slice(0, evictN).forEach(k => L2.delete(k));
+      cacheLog.warn(`Memory pressure (${(ratio * 100).toFixed(1)}%) — evicted ${evictN} L2 entries`);
+    }
+  }
+  setInterval(checkMemPressure, 30_000);
 
   const router = express.Router();
+
   router.get('/stats', (req, res) => {
     const mem = process.memoryUsage();
-    res.json({ metrics: m.snapshot(), l1: L1.info(), l2: L2.info(), inflight: inflight.size, memory: { rssMB: +(mem.rss/1048576).toFixed(1), heapMB: +(mem.heapUsed/1048576).toFixed(1), totalMB: +(os.totalmem()/1048576).toFixed(0), pressure: +((mem.rss / os.totalmem()) * 100).toFixed(1) + '%' }, config: CFG });
+    res.json({
+      metrics  : m.snapshot(),
+      l1       : L1.info(),
+      l2       : L2.info(),
+      inflight : inflight.size,
+      memory   : {
+        rssMB   : +(mem.rss        / 1048576).toFixed(1),
+        heapMB  : +(mem.heapUsed   / 1048576).toFixed(1),
+        totalMB : +(os.totalmem()  / 1048576).toFixed(0),
+        pressure: +((mem.rss / os.totalmem()) * 100).toFixed(1) + '%',
+      },
+      config   : CFG,
+    });
   });
-  router.delete('/all', (req, res) => { const l1 = L1.clear(), l2 = L2.clear(); inflight.clear(); _hitCount.clear(); cacheLog.info('Full cache clear', { l1, l2 }); res.json({ cleared: { l1, l2 }, message: 'Cache cleared' }); });
-  router.delete('/tag/:tag', (req, res) => res.json({ invalidated: invalidateTag(req.params.tag), tag: req.params.tag }));
-  router.delete('/key/:key', (req, res) => { del(decodeURIComponent(req.params.key)); res.json({ deleted: req.params.key }); });
-  router.get('/keys', (req, res) => { const limit = Math.min(parseInt(req.query.limit || '50', 10), 500); res.json({ l1: L1.keys().slice(0, limit), l2: L2.keys().slice(0, limit) }); });
 
-  return { get, set, del, invalidateTag, getOrFetch, router };
+  router.delete('/all', (req, res) => {
+    const l1 = L1.clear(), l2 = L2.clear();
+    inflight.clear();
+    _hitCount.clear();
+    cacheLog.info('Full cache clear', { l1, l2 });
+    res.json({ cleared: { l1, l2 }, message: 'Cache cleared' });
+  });
+
+  router.delete('/tag/:tag', (req, res) => {
+    const n = invalidateTag(req.params.tag);
+    res.json({ invalidated: n, tag: req.params.tag });
+  });
+
+  router.delete('/key/:key', (req, res) => {
+    del(decodeURIComponent(req.params.key));
+    res.json({ deleted: req.params.key });
+  });
+
+  router.get('/keys', (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit || '50', 10), 500);
+    res.json({ l1: L1.keys().slice(0, limit), l2: L2.keys().slice(0, limit) });
+  });
+
+  return { get, set, del, invalidateTag, getOrFetch, metrics: m, L1, L2, router, CFG };
 })();
 
 
 // ═══════════════════════════════════════════════════════════════════
-//  3. SECURITY CONFIG MODULE
+//  3. SECURITY CONFIG MODULE (With Full HTML Support Fixes)
 // ═══════════════════════════════════════════════════════════════════
 const SecurityConfig = (() => {
-  const secLog = createLogger('Security');
+  const secLog = Logger.createLogger('Security');
 
   const EMBED_ORIGINS =[
     'vidsrc.pro', '*.vidsrc.pro', 'vidsrc.me', '*.vidsrc.me', 'vidsrc.cc', '*.vidsrc.cc',
@@ -343,24 +486,37 @@ const SecurityConfig = (() => {
     contentSecurityPolicy: {
       directives: {
         defaultSrc        : ["'self'"],
-        scriptSrc         :["'self'", 'cdn.tailwindcss.com', 'cdn.jsdelivr.net', 'cdnjs.cloudflare.com', 'unpkg.com', "'unsafe-eval'"],
-        styleSrc          :["'self'", "'unsafe-inline'", 'fonts.googleapis.com', 'cdn.jsdelivr.net', 'cdnjs.cloudflare.com'],
-        fontSrc           : ["'self'", 'fonts.gstatic.com', 'cdnjs.cloudflare.com', 'data:'],
-        imgSrc            :["'self'", 'image.tmdb.org', 'media.themoviedb.org', 'api.dicebear.com', 'secure.gravatar.com', 'via.placeholder.com', 'data:', 'blob:'],
-        mediaSrc          :["'self'", 'blob:', ...EMBED_ORIGINS],
-        connectSrc        :["'self'", 'api.themoviedb.org', 'https://api.themoviedb.org', 'wss://echo.websocket.events'],
+        // Fix: Added 'unsafe-inline' and 'unsafe-eval' for index.html functionality
+        scriptSrc         :[
+          "'self'", 
+          "cdn.tailwindcss.com", 
+          "cdn.jsdelivr.net", 
+          "cdnjs.cloudflare.com", 
+          "unpkg.com", 
+          "'unsafe-inline'", 
+          "'unsafe-eval'"
+        ],
+        styleSrc          :["'self'", "'unsafe-inline'", "fonts.googleapis.com", "cdn.jsdelivr.net", "cdnjs.cloudflare.com"],
+        fontSrc           :["'self'", "fonts.gstatic.com", "cdnjs.cloudflare.com", "data:"],
+        imgSrc            :["'self'", "image.tmdb.org", "media.themoviedb.org", "api.dicebear.com", "secure.gravatar.com", "via.placeholder.com", "data:", "blob:"],
+        mediaSrc          : ["'self'", "blob:", ...EMBED_ORIGINS],
+        connectSrc        :["'self'", "api.themoviedb.org", "https://api.themoviedb.org", "wss://echo.websocket.events"],
         frameSrc          :["'self'", ...EMBED_ORIGINS],
-        frameAncestors    : ["'none'"],
-        workerSrc         : ["'self'", 'blob:'],
-        childSrc          :["'self'", 'blob:', ...EMBED_ORIGINS],
+        frameAncestors    : ["'none'"],       // block clickjacking
+        workerSrc         : ["'self'", "blob:"],
+        childSrc          :["'self'", "blob:", ...EMBED_ORIGINS],
         objectSrc         : ["'none'"],
-        manifestSrc       :["'self'"],
+        manifestSrc       : ["'self'"],
         baseUri           : ["'self'"],
-        formAction        :["'self'"],
+        formAction        : ["'self'"],
         upgradeInsecureRequests:[],
       },
     },
-    strictTransportSecurity: { maxAge: 31_536_000, includeSubDomains: true, preload: true },
+    strictTransportSecurity: {
+      maxAge           : 31_536_000,
+      includeSubDomains: true,
+      preload          : true,
+    },
     referrerPolicy       : { policy: 'strict-origin-when-cross-origin' },
     frameguard           : { action: 'deny' },
     hidePoweredBy        : true,
@@ -368,24 +524,39 @@ const SecurityConfig = (() => {
     ieNoOpen             : true,
     xssFilter            : true,
     dnsPrefetchControl   : { allow: true },
-    crossOriginEmbedderPolicy: false,
+    crossOriginEmbedderPolicy: false,   // Must be false to allow embed iframes
   });
 
   function additionalHeaders(req, res, next) {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-BingeBox-Server', `Omega/${process.env.npm_package_version || '3.0.0'}`);
     if (!res.getHeader('X-BingeBox-Cache')) res.setHeader('X-BingeBox-Cache', 'MISS');
-    res.setHeader('Permissions-Policy', 'camera=(), microphone=(self), geolocation=(), payment=(), usb=(), bluetooth=(), fullscreen=(self), picture-in-picture=(self), autoplay=(self), encrypted-media=(self)');
-    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+
+    res.setHeader('Permissions-Policy',[
+      'camera=()', 'microphone=(self)', 'geolocation=()', 'payment=()',
+      'usb=()', 'bluetooth=()', 'fullscreen=(self)',
+      'picture-in-picture=(self)', 'autoplay=(self)', 'encrypted-media=(self)',
+    ].join(', '));
+
+    res.setHeader('Cross-Origin-Opener-Policy',   'same-origin-allow-popups');
     res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
-    res.removeHeader('X-Powered-By'); res.removeHeader('Server');
+
+    res.removeHeader('X-Powered-By');
+    res.removeHeader('Server');
     next();
   }
 
-  const BOT_RX =[/scrapy/i, /python-requests/i, /go-http-client/i, /java\//i, /zgrab/i, /masscan/i, /nmap/i];
+  const BOT_RX =[
+    /scrapy/i, /python-requests/i, /go-http-client/i,
+    /java\//i, /zgrab/i, /masscan/i, /nmap/i,
+  ];
+
   function botDetection(req, res, next) {
     const ua = (req.headers['user-agent'] || '').trim();
-    if (!ua) { res.setHeader('X-BingeBox-Client-Type', 'headless'); return next(); }
+    if (!ua) {
+      res.setHeader('X-BingeBox-Client-Type', 'headless');
+      return next();
+    }
     if (BOT_RX.some(rx => rx.test(ua))) {
       secLog.warn('Bot blocked', { ip: req.ip, ua: ua.slice(0, 100) });
       return res.status(403).json({ error: 'forbidden', message: 'Automated clients are not permitted.' });
@@ -393,36 +564,69 @@ const SecurityConfig = (() => {
     next();
   }
 
-  const RATE = { windowMs: 60_000, maxHits: 200, blockMs: 5 * 60_000, skip: new Set(['/health', '/health/ready', '/favicon.ico', '/robots.txt']) };
+  const RATE = {
+    windowMs : 60_000,
+    maxHits  : 200,
+    blockMs  : 5 * 60_000,
+    skip     : new Set(['/health', '/health/ready', '/favicon.ico', '/robots.txt']),
+  };
+
   const _store = new Map();
-  setInterval(() => { const now = Date.now(); for (const [ip, e] of _store) { if (!e.hits.length || now - e.hits[e.hits.length - 1] > RATE.blockMs * 2) _store.delete(ip); } }, 10 * 60_000);
+
+  setInterval(() => {
+    const now = Date.now();
+    for (const [ip, e] of _store) {
+      if (!e.hits.length || now - e.hits[e.hits.length - 1] > RATE.blockMs * 2) {
+        _store.delete(ip);
+      }
+    }
+  }, 10 * 60_000);
 
   function rateLimiter(req, res, next) {
     if (RATE.skip.has(req.path)) return next();
-    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+
+    const ip  = req.ip || req.socket?.remoteAddress || 'unknown';
     const now = Date.now();
-    let e = _store.get(ip);
+    let e     = _store.get(ip);
+
     if (!e) { e = { hits:[], blocked: false, blockedUntil: 0 }; _store.set(ip, e); }
+
     if (e.blocked) {
       if (now < e.blockedUntil) {
         const retryAfter = Math.ceil((e.blockedUntil - now) / 1000);
         res.setHeader('Retry-After', retryAfter);
-        return res.status(429).json({ error: 'rate_limited', message: 'Too many requests — please slow down.', retryAfter });
+        return res.status(429).json({
+          error     : 'rate_limited',
+          message   : 'Too many requests — please slow down.',
+          retryAfter,
+        });
       }
       e.blocked = false; e.blockedUntil = 0; e.hits =[];
     }
-    e.hits = e.hits.filter(t => now - t < RATE.windowMs); e.hits.push(now);
+
+    e.hits = e.hits.filter(t => now - t < RATE.windowMs);
+    e.hits.push(now);
+
     const remaining = Math.max(0, RATE.maxHits - e.hits.length);
-    res.setHeader('X-RateLimit-Limit', RATE.maxHits); res.setHeader('X-RateLimit-Remaining', remaining); res.setHeader('X-RateLimit-Reset', Math.ceil((now + RATE.windowMs) / 1000));
+    res.setHeader('X-RateLimit-Limit',     RATE.maxHits);
+    res.setHeader('X-RateLimit-Remaining', remaining);
+    res.setHeader('X-RateLimit-Reset',     Math.ceil((now + RATE.windowMs) / 1000));
+
     if (e.hits.length > RATE.maxHits) {
-      e.blocked = true; e.blockedUntil = now + RATE.blockMs;
+      e.blocked      = true;
+      e.blockedUntil = now + RATE.blockMs;
       secLog.warn('Rate limit exceeded', { ip, hits: e.hits.length });
-      return res.status(429).json({ error: 'rate_limited', message: 'Rate limit exceeded.', retryAfter: RATE.blockMs / 1000 });
+      return res.status(429).json({
+        error     : 'rate_limited',
+        message   : 'Rate limit exceeded.',
+        retryAfter: RATE.blockMs / 1000,
+      });
     }
+
     next();
   }
 
-  return[helmetMw, additionalHeaders, botDetection, rateLimiter];
+  return [helmetMw, additionalHeaders, botDetection, rateLimiter];
 })();
 
 
@@ -430,19 +634,28 @@ const SecurityConfig = (() => {
 //  4. CORS CONFIG MODULE
 // ═══════════════════════════════════════════════════════════════════
 const CorsConfig = (() => {
-  const corsLog = createLogger('CORS');
-  const IS_DEV = process.env.NODE_ENV !== 'production';
-  const STATIC_ORIGINS =['http://localhost:3000', 'http://localhost:5000', 'http://127.0.0.1:3000', 'http://127.0.0.1:5000'];
+  const corsLog = Logger.createLogger('CORS');
+  const IS_DEV  = process.env.NODE_ENV !== 'production';
+
+  const STATIC_ORIGINS =[
+    'http://localhost:3000',
+    'http://localhost:5000',
+    'http://localhost:8080',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:5000',
+  ];
 
   function buildAllowList() {
     const env =[];
-    if (process.env.CLIENT_URL) env.push(...process.env.CLIENT_URL.split(',').map(s => s.trim()).filter(Boolean));
+    if (process.env.CLIENT_URL) {
+      env.push(...process.env.CLIENT_URL.split(',').map(s => s.trim()).filter(Boolean));
+    }
     if (process.env.STAGING_URL) env.push(process.env.STAGING_URL.trim());
     if (process.env.PREVIEW_URL) env.push(process.env.PREVIEW_URL.trim());
     return [...new Set([...STATIC_ORIGINS, ...env])];
   }
 
-  const TRUSTED_PATTERNS = [
+  const TRUSTED_PATTERNS =[
     /^https:\/\/([\w-]+\.)?bingebox\.(tv|app|io)$/,
     /^https:\/\/[\w-]+-bingebox\.vercel\.app$/,
     /^https:\/\/[\w-]+-bingebox\.netlify\.app$/,
@@ -451,13 +664,16 @@ const CorsConfig = (() => {
   ];
 
   const _rejected = new Map();
+
   function trackRejection(origin) {
     if (_rejected.size > 200) return;
-    const e = _rejected.get(origin) || { count: 0, first: Date.now() }; e.count++; _rejected.set(origin, e);
+    const e = _rejected.get(origin) || { count: 0, first: Date.now() };
+    e.count++;
+    _rejected.set(origin, e);
   }
 
   function isAllowed(origin) {
-    if (!origin) return true;
+    if (!origin) return true;                                       // same-origin / curl
     if (buildAllowList().includes(origin)) return true;
     if (TRUSTED_PATTERNS.some(rx => rx.test(origin))) return true;
     return false;
@@ -465,22 +681,44 @@ const CorsConfig = (() => {
 
   const corsOptions = {
     origin(origin, cb) {
-      if (isAllowed(origin)) { if (IS_DEV) corsLog.debug('ALLOW', { origin: origin || '<same-origin>' }); cb(null, true); } 
-      else { trackRejection(origin); corsLog.warn('BLOCK', { origin, rejections: _rejected.get(origin)?.count }); cb(new Error(`CORS: origin "${origin}" is not permitted`)); }
+      if (isAllowed(origin)) {
+        if (IS_DEV) corsLog.debug('ALLOW', { origin: origin || '<same-origin>' });
+        cb(null, true);
+      } else {
+        trackRejection(origin);
+        corsLog.warn('BLOCK', { origin, rejections: _rejected.get(origin)?.count });
+        cb(new Error(`CORS: origin "${origin}" is not permitted`));
+      }
     },
-    methods:['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
-    allowedHeaders:['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Accept-Language', 'Cache-Control', 'X-BingeBox-Client', 'X-BingeBox-Version'],
-    exposedHeaders:['X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset', 'X-BingeBox-Cache', 'X-BingeBox-Server', 'Content-Length', 'Content-Range', 'ETag'],
-    credentials: true, maxAge: 7_200, optionsSuccessStatus: 204, preflightContinue: false,
+    methods         : ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
+    allowedHeaders  :[
+      'Content-Type', 'Authorization', 'X-Requested-With',
+      'Accept', 'Accept-Language', 'Cache-Control',
+      'X-BingeBox-Client', 'X-BingeBox-Version',
+    ],
+    exposedHeaders  :[
+      'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset',
+      'X-BingeBox-Cache', 'X-BingeBox-Server',
+      'Content-Length', 'Content-Range', 'ETag',
+    ],
+    credentials          : true,
+    maxAge               : 7_200,
+    optionsSuccessStatus : 204,
+    preflightContinue    : false,
   };
 
   const _corsHandler = cors(corsOptions);
+
   function safeCors(req, res, next) {
     _corsHandler(req, res, err => {
       if (!err) return next();
       corsLog.error('CORS middleware error', { message: err.message, origin: req.headers.origin });
       res.setHeader('Content-Type', 'application/json');
-      res.status(403).json({ error: 'cors_blocked', message: err.message, origin: req.headers.origin || null });
+      res.status(403).json({
+        error  : 'cors_blocked',
+        message: err.message,
+        origin : req.headers.origin || null,
+      });
     });
   }
 
@@ -489,91 +727,179 @@ const CorsConfig = (() => {
 
 
 // ═══════════════════════════════════════════════════════════════════
-//  5. API PROXY MODULE
+//  5. API PROXY MODULE (With Custom API Key Fallback)
 // ═══════════════════════════════════════════════════════════════════
 const ApiProxy = (() => {
   const router = express.Router();
-  const proxyLog = createLogger('Proxy');
-  
+  const proxyLog = Logger.createLogger('Proxy');
+
   const TMDB_BASE   = 'https://api.themoviedb.org/3';
   const TMDB_KEY    = process.env.TMDB_API_KEY || '15d2ea6d0dc1d476efbca3eba2b9bbfb';
   const REQ_TIMEOUT = 8_000;
   const MAX_RETRIES = 2;
-  const BACKOFF     = 300;
+  const BACKOFF     = 300;   // ms base for exponential back-off
 
-  const TTL_MAP = [['/trending', 60_000], ['/search', 90_000],['/discover', 3*60_000], ['/movie', 10*60_000],['/tv', 10*60_000],['/genre', 60*60_000], ['/person', 30*60_000]];
-  function getTTL(p) { for (const [prefix, ttl] of TTL_MAP) if (p.startsWith(prefix)) return ttl; return 5 * 60_000; }
+  const TTL_MAP = [['/trending',  60_000], ['/search',    90_000],['/discover',  3 * 60_000],['/movie',     10 * 60_000], ['/tv', 10 * 60_000],['/genre', 60 * 60_000],['/person', 30 * 60_000],
+  ];
+
+  function getTTL(p) {
+    for (const[prefix, ttl] of TTL_MAP) if (p.startsWith(prefix)) return ttl;
+    return 5 * 60_000;
+  }
 
   const circuit = {
-    failures: 0, lastFail: 0, threshold: 10, resetAfter: 60_000,
-    isOpen() { if (this.failures < this.threshold) return false; if (Date.now() - this.lastFail > this.resetAfter) { this.failures = 0; return false; } return true; },
-    record(ok) { if (ok) { this.failures = 0; } else { this.failures++; this.lastFail = Date.now(); } },
+    failures  : 0,
+    lastFail  : 0,
+    threshold : 10,
+    resetAfter: 60_000,
+
+    isOpen() {
+      if (this.failures < this.threshold) return false;
+      if (Date.now() - this.lastFail > this.resetAfter) { this.failures = 0; return false; }
+      return true;
+    },
+    record(ok) {
+      if (ok) { this.failures = 0; }
+      else    { this.failures++; this.lastFail = Date.now(); }
+    },
   };
 
-  function tmdbFetch(rawPath, params = {}, attempt = 0) {
+  function tmdbFetch(rawPath, params = {}, customKey = null, attempt = 0) {
     return new Promise((resolve, reject) => {
       const cleanPath = '/' + rawPath.replace(/^\/+/, '');
-      const qs = new URLSearchParams({ api_key: TMDB_KEY, ...params }).toString();
-      const url = `${TMDB_BASE}${cleanPath}?${qs}`;
+      // Fix: Applies the user's custom API key from the frontend if provided
+      const activeKey = customKey || TMDB_KEY;
+      const qs        = new URLSearchParams({ api_key: activeKey, ...params }).toString();
+      const url       = `${TMDB_BASE}${cleanPath}?${qs}`;
 
       proxyLog.debug(`→ TMDB ${cleanPath}`, { attempt, params: Object.keys(params) });
 
-      const req = https.get(url, { headers: { Accept: 'application/json', 'User-Agent': 'BingeBox-Omega/3.0' }, timeout: REQ_TIMEOUT }, res => {
-        let body = ''; res.setEncoding('utf8');
+      const req = https.get(url, {
+        headers: { Accept: 'application/json', 'User-Agent': 'BingeBox-Omega/3.0' },
+        timeout: REQ_TIMEOUT,
+      }, res => {
+        let body = '';
+        res.setEncoding('utf8');
         res.on('data', d => { body += d; });
         res.on('end', () => {
           if (res.statusCode === 429 && attempt < MAX_RETRIES) {
             const wait = BACKOFF * Math.pow(2, attempt);
             proxyLog.warn(`TMDB 429 — retrying in ${wait}ms`, { path: cleanPath, attempt });
-            return setTimeout(() => tmdbFetch(rawPath, params, attempt + 1).then(resolve).catch(reject), wait);
+            return setTimeout(() => tmdbFetch(rawPath, params, customKey, attempt + 1).then(resolve).catch(reject), wait);
           }
-          if (res.statusCode >= 400) { circuit.record(false); return reject(Object.assign(new Error(`TMDB ${res.statusCode}: ${cleanPath}`), { status: res.statusCode })); }
-          try { const data = JSON.parse(body); circuit.record(true); resolve(data); } 
-          catch (e) { circuit.record(false); reject(Object.assign(new Error('TMDB JSON parse error'), { status: 502 })); }
+
+          if (res.statusCode >= 400) {
+            circuit.record(false);
+            const err = Object.assign(new Error(`TMDB ${res.statusCode}: ${cleanPath}`), { status: res.statusCode });
+            return reject(err);
+          }
+
+          try {
+            const data = JSON.parse(body);
+            circuit.record(true);
+            resolve(data);
+          } catch (e) {
+            circuit.record(false);
+            reject(Object.assign(new Error('TMDB JSON parse error'), { status: 502 }));
+          }
         });
       });
-      req.on('timeout', () => { req.destroy(); circuit.record(false); reject(Object.assign(new Error(`TMDB timeout: ${cleanPath}`), { status: 504 })); });
+
+      req.on('timeout', () => {
+        req.destroy();
+        circuit.record(false);
+        reject(Object.assign(new Error(`TMDB timeout: ${cleanPath}`), { status: 504 }));
+      });
+
       req.on('error', err => {
         circuit.record(false);
         if ((err.code === 'ECONNRESET' || err.message === 'socket hang up') && attempt < MAX_RETRIES) {
           const wait = BACKOFF * Math.pow(2, attempt);
-          return setTimeout(() => tmdbFetch(rawPath, params, attempt + 1).then(resolve).catch(reject), wait);
+          return setTimeout(() => tmdbFetch(rawPath, params, customKey, attempt + 1).then(resolve).catch(reject), wait);
         }
         reject(Object.assign(err, { status: 502 }));
       });
     });
   }
 
-  async function proxiedFetch(path, params = {}) {
-    if (circuit.isOpen()) throw Object.assign(new Error('TMDB circuit breaker OPEN — service temporarily unavailable'), { status: 503 });
-    const cacheKey = `tmdb:${path}:${new URLSearchParams(params).toString()}`;
-    return CacheManager.getOrFetch(cacheKey, () => tmdbFetch(path, params), getTTL(path), ['tmdb']);
+  async function proxiedFetch(path, params = {}, customKey = null) {
+    if (circuit.isOpen()) {
+      const err = Object.assign(
+        new Error('TMDB circuit breaker OPEN — service temporarily unavailable'),
+        { status: 503 }
+      );
+      throw err;
+    }
+
+    // Include custom key in cache generation to prevent cache contamination between keys
+    const cacheKey = `tmdb:${path}:${customKey || 'sys'}:${new URLSearchParams(params).toString()}`;
+    const ttl      = getTTL(path);
+
+    return CacheManager.getOrFetch(
+      cacheKey,
+      () => tmdbFetch(path, params, customKey),
+      ttl, ['tmdb']
+    );
   }
 
   router.get('/tmdb/*', async (req, res) => {
-    const tmdbPath = '/' + req.params[0], params = { ...req.query };
-    delete params.api_key;
+    const tmdbPath = '/' + req.params[0];
+    const params   = { ...req.query };
+    const customKey = params.api_key;
+    delete params.api_key; // Strip to avoid overriding the proxy internal mapping
+
     try {
-      const data = await proxiedFetch(tmdbPath, params);
-      const ttlSecs = Math.floor(getTTL(tmdbPath) / 1000);
-      const hit = CacheManager.get(`tmdb:${tmdbPath}:${new URLSearchParams(params).toString()}`);
-      res.setHeader('Cache-Control', `public, max-age=${ttlSecs}`); res.setHeader('X-BingeBox-Cache', hit ? hit.source : 'FETCH');
+      const data     = await proxiedFetch(tmdbPath, params, customKey);
+      const ttlSecs  = Math.floor(getTTL(tmdbPath) / 1000);
+      const cacheKey = `tmdb:${tmdbPath}:${customKey || 'sys'}:${new URLSearchParams(params).toString()}`;
+      const hit      = CacheManager.get(cacheKey);
+
+      res.setHeader('Cache-Control',    `public, max-age=${ttlSecs}`);
+      res.setHeader('X-BingeBox-Cache', hit ? hit.source : 'FETCH');
       res.json(data);
     } catch (err) {
       proxyLog.error(`Proxy error ${tmdbPath}`, { msg: err.message, status: err.status });
-      res.status(err.status || 502).json({ error: 'tmdb_error', message: err.message, path: tmdbPath });
+      res.status(err.status || 502).json({
+        error  : 'tmdb_error',
+        message: err.message,
+        path   : tmdbPath,
+      });
     }
   });
 
   router.post('/tmdb/batch', express.json({ limit: '64kb' }), async (req, res) => {
     const { requests } = req.body || {};
-    if (!Array.isArray(requests) || !requests.length || requests.length > 10) return res.status(400).json({ error: 'bad_request', message: 'Send 1–10 requests.' });
-    const settled = await Promise.allSettled(requests.map(({ path: p, params }) => proxiedFetch(p, params || {})));
-    res.json({ results: settled.map((r, i) => ({ path: requests[i].path, status: r.status === 'fulfilled' ? 'ok' : 'error', data: r.status === 'fulfilled' ? r.value : null, error: r.status === 'rejected' ? r.reason.message : null })) });
+
+    if (!Array.isArray(requests) || !requests.length || requests.length > 10) {
+      return res.status(400).json({ error: 'bad_request', message: 'Send 1–10 requests.' });
+    }
+
+    const settled = await Promise.allSettled(
+      requests.map(({ path: p, params }) => proxiedFetch(p, params || {}))
+    );
+
+    res.json({
+      results: settled.map((r, i) => ({
+        path  : requests[i].path,
+        status: r.status === 'fulfilled' ? 'ok' : 'error',
+        data  : r.status === 'fulfilled' ? r.value : null,
+        error : r.status === 'rejected'  ? r.reason.message : null,
+      })),
+    });
   });
 
   router.get('/tmdb/cache-info', (req, res) => {
-    res.json({ cache: { l1: CacheManager.L1?.info() || {}, l2: CacheManager.L2?.info() || {} }, circuit: { failures: circuit.failures, threshold: circuit.threshold, isOpen: circuit.isOpen() } });
+    res.json({
+      cache  : { l1: CacheManager.L1.info(), l2: CacheManager.L2.info() },
+      circuit: {
+        failures : circuit.failures,
+        threshold: circuit.threshold,
+        isOpen   : circuit.isOpen(),
+        resetIn  : circuit.isOpen()
+          ? Math.max(0, circuit.resetAfter - (Date.now() - circuit.lastFail)) + 'ms'
+          : null,
+      },
+    });
   });
 
   router.delete('/tmdb/cache', (req, res) => {
@@ -591,7 +917,7 @@ const ApiProxy = (() => {
 // ═══════════════════════════════════════════════════════════════════
 const HealthMonitor = (() => {
   const router = express.Router();
-  const healthLog = createLogger('Health');
+  const healthLog = Logger.createLogger('Health');
 
   const BOOT_TIME  = Date.now();
   const TMDB_PROBE = 'https://api.themoviedb.org/3/configuration';
@@ -599,91 +925,249 @@ const HealthMonitor = (() => {
   const PUBLIC_DIR = path.join(__dirname, 'public');
 
   let VERSION = '3.0.0';
+  try { VERSION = require('./package.json').version; } catch (_) {}
 
-  const THRESH = { CPU_WARN: 70, CPU_CRIT: 90, MEM_WARN: 75, MEM_CRIT: 90, HEAP_WARN_MB: 400, HEAP_CRIT_MB: 700, EL_WARN_MS: 50, EL_CRIT_MS: 200, PROBE_TIMEOUT: 5_000 };
-  const state = { cpu: { current: 0, avg5s: 0, samples:[] }, memory: {}, heap: { usedMB: 0, totalMB: 0, externalMB: 0, rssMB: 0 }, eventLoop: { lagMs: 0, samples:[] }, checks: new Map(), incidents:[], sla: { downtimeMs: 0, lastDown: null } };
+  const THRESH = {
+    CPU_WARN     : 70,
+    CPU_CRIT     : 90,
+    MEM_WARN     : 75,
+    MEM_CRIT     : 90,
+    HEAP_WARN_MB : 400,
+    HEAP_CRIT_MB : 700,
+    EL_WARN_MS   : 50,
+    EL_CRIT_MS   : 200,
+    PROBE_TIMEOUT: 5_000,
+  };
 
-  let _overallStatus = 'ok', _lastCpuSamples = os.cpus() ||[];
-  
-  function sampleMetrics() {
+  const state = {
+    cpu      : { current: 0, avg5s: 0, samples:[] },
+    memory   : {},
+    heap     : { usedMB: 0, totalMB: 0, externalMB: 0, rssMB: 0 },
+    eventLoop: { lagMs: 0, samples: [] },
+    checks   : new Map(),
+    incidents:[],
+    sla      : { downtimeMs: 0, lastDown: null },
+  };
+
+  let _overallStatus  = 'ok';
+  let _lastCpuSamples = os.cpus() ||[];
+
+  function sampleCPU() {
     const cpus = os.cpus() ||[];
-    if (cpus.length) {
-      const deltas = cpus.map((cpu, i) => {
-        const prev = _lastCpuSamples[i] || cpu, idle = cpu.times.idle - (prev.times?.idle || 0);
-        const total = Object.values(cpu.times).reduce((a, b) => a + b, 0) - Object.values(prev.times || {}).reduce((a, b) => a + b, 0);
-        return total > 0 ? (1 - idle / total) * 100 : 0;
-      });
-      _lastCpuSamples = cpus;
-      const avg = deltas.reduce((a, b) => a + b, 0) / deltas.length;
-      state.cpu.current = +avg.toFixed(1); state.cpu.samples.push(avg);
-      if (state.cpu.samples.length > 30) state.cpu.samples.shift();
-      state.cpu.avg5s = +(state.cpu.samples.reduce((a, b) => a + b, 0) / state.cpu.samples.length).toFixed(1);
-    }
-    const mem = process.memoryUsage(), total = os.totalmem(), free = os.freemem(), used = total - free, pct = (used / total) * 100;
-    state.memory = { usedMB: +(used/1048576).toFixed(1), freeMB: +(free/1048576).toFixed(1), totalMB: +(total/1048576).toFixed(0), pct: +pct.toFixed(1) };
-    state.heap = { usedMB: +(mem.heapUsed/1048576).toFixed(1), totalMB: +(mem.heapTotal/1048576).toFixed(1), externalMB: +(mem.external/1048576).toFixed(1), rssMB: +(mem.rss/1048576).toFixed(1) };
-    
+    if (!cpus.length) return;
+
+    const deltas = cpus.map((cpu, i) => {
+      const prev  = _lastCpuSamples[i] || cpu;
+      const idle  = cpu.times.idle  - (prev.times?.idle  || 0);
+      const total = Object.values(cpu.times).reduce((a, b) => a + b, 0)
+                  - Object.values(prev.times || {}).reduce((a, b) => a + b, 0);
+      return total > 0 ? (1 - idle / total) * 100 : 0;
+    });
+    _lastCpuSamples = cpus;
+
+    const avg = deltas.reduce((a, b) => a + b, 0) / deltas.length;
+    state.cpu.current = +avg.toFixed(1);
+    state.cpu.samples.push(avg);
+    if (state.cpu.samples.length > 30) state.cpu.samples.shift();
+    state.cpu.avg5s = +(state.cpu.samples.reduce((a, b) => a + b, 0) / state.cpu.samples.length).toFixed(1);
+  }
+
+  function sampleMemory() {
+    const total   = os.totalmem();
+    const free    = os.freemem();
+    const used    = total - free;
+    const prevPct = state.memory.pct || 0;
+    const pct     = (used / total) * 100;
+
+    state.memory = {
+      usedMB : +(used   / 1048576).toFixed(1),
+      freeMB : +(free   / 1048576).toFixed(1),
+      totalMB: +(total  / 1048576).toFixed(0),
+      pct    : +pct.toFixed(1),
+      trend  : pct > prevPct + 2 ? 'rising' : pct < prevPct - 2 ? 'falling' : 'stable',
+    };
+  }
+
+  function sampleHeap() {
+    const m = process.memoryUsage();
+    state.heap = {
+      usedMB    : +(m.heapUsed   / 1048576).toFixed(1),
+      totalMB   : +(m.heapTotal  / 1048576).toFixed(1),
+      externalMB: +(m.external   / 1048576).toFixed(1),
+      rssMB     : +(m.rss        / 1048576).toFixed(1),
+    };
+  }
+
+  function sampleEventLoop() {
     const start = process.hrtime.bigint();
     setImmediate(() => {
       const lag = Number(process.hrtime.bigint() - start) / 1e6;
       state.eventLoop.samples.push(lag);
       if (state.eventLoop.samples.length > 10) state.eventLoop.samples.shift();
-      state.eventLoop.lagMs = +(state.eventLoop.samples.reduce((a, b) => a + b, 0) / state.eventLoop.samples.length).toFixed(2);
+      state.eventLoop.lagMs = +(
+        state.eventLoop.samples.reduce((a, b) => a + b, 0) / state.eventLoop.samples.length
+      ).toFixed(2);
     });
   }
-  setInterval(sampleMetrics, 1_000);
+
+  setInterval(() => { sampleCPU(); sampleMemory(); sampleHeap(); sampleEventLoop(); }, 1_000);
 
   function registerCheck(name, fn, intervalMs = 30_000) {
     const entry = { status: 'unknown', lastCheck: null, latencyMs: 0, message: '', history:[] };
     state.checks.set(name, entry);
+
     async function run() {
       const t0 = Date.now();
       try {
-        const r = await fn();
-        entry.latencyMs = Date.now() - t0; entry.status = r.status || 'ok'; entry.message = r.message || ''; entry.lastCheck = new Date().toISOString();
+        const r        = await fn();
+        entry.latencyMs = Date.now() - t0;
+        entry.status    = r.status || 'ok';
+        entry.message   = r.message || '';
+        entry.lastCheck = new Date().toISOString();
       } catch (err) {
-        entry.latencyMs = Date.now() - t0; entry.status = 'error'; entry.message = err.message; entry.lastCheck = new Date().toISOString();
-        state.incidents.push({ ts: entry.lastCheck, check: name, message: err.message });
+        entry.latencyMs = Date.now() - t0;
+        entry.status    = 'error';
+        entry.message   = err.message;
+        entry.lastCheck = new Date().toISOString();
+        const incident  = { ts: entry.lastCheck, check: name, message: err.message };
+        state.incidents.push(incident);
         if (state.incidents.length > 50) state.incidents.shift();
         healthLog.warn(`Health check FAIL: ${name}`, { msg: err.message });
       }
-      entry.history.push(entry.status); if (entry.history.length > 10) entry.history.shift();
+      entry.history.push(entry.status);
+      if (entry.history.length > 10) entry.history.shift();
     }
-    run(); setInterval(run, intervalMs);
+
+    run(); 
+    setInterval(run, intervalMs);
   }
 
   registerCheck('tmdb-api', () => new Promise((resolve, reject) => {
-    const req = https.get(`${TMDB_PROBE}?api_key=${TMDB_KEY}`, { timeout: THRESH.PROBE_TIMEOUT }, res => { const ok = res.statusCode === 200; resolve({ status: ok ? 'ok' : 'degraded', message: `HTTP ${res.statusCode}` }); res.resume(); });
-    req.on('error', reject); req.on('timeout', () => req.destroy(new Error('Probe timeout')));
+    const url = `${TMDB_PROBE}?api_key=${TMDB_KEY}`;
+    const req = https.get(url, { timeout: THRESH.PROBE_TIMEOUT }, res => {
+      const ok = res.statusCode === 200;
+      resolve({ status: ok ? 'ok' : 'degraded', message: `HTTP ${res.statusCode}` });
+      res.resume();
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(new Error('Probe timeout')); });
   }), 60_000);
 
   registerCheck('static-files', async () => {
     const idx = path.join(PUBLIC_DIR, 'index.html');
     if (!fs.existsSync(idx)) throw new Error('public/index.html missing');
-    return { status: 'ok', message: `${(fs.statSync(idx).size / 1024).toFixed(0)}KB` };
+    const { size } = fs.statSync(idx);
+    return { status: 'ok', message: `${(size / 1024).toFixed(0)}KB` };
   }, 120_000);
 
   function calcStatus() {
     let status = 'ok';
-    for (const [, c] of state.checks) { if (c.status === 'error') { status = 'down'; break; } if (c.status === 'degraded') status = 'degraded'; }
-    if (state.cpu.avg5s > THRESH.CPU_CRIT || state.memory.pct > THRESH.MEM_CRIT || state.heap.usedMB > THRESH.HEAP_CRIT_MB || state.eventLoop.lagMs > THRESH.EL_CRIT_MS) status = 'degraded';
-    if (status !== 'ok' && _overallStatus === 'ok') state.sla.lastDown = Date.now();
-    if (status === 'ok' && _overallStatus !== 'ok' && state.sla.lastDown) { state.sla.downtimeMs += Date.now() - state.sla.lastDown; state.sla.lastDown = null; }
-    _overallStatus = status; return status;
+    for (const[, c] of state.checks) {
+      if (c.status === 'error')    { status = 'down';     break; }
+      if (c.status === 'degraded') { status = 'degraded'; }
+    }
+    if (state.cpu.avg5s       > THRESH.CPU_CRIT)   status = 'degraded';
+    if (state.memory.pct      > THRESH.MEM_CRIT)   status = 'degraded';
+    if (state.heap.usedMB     > THRESH.HEAP_CRIT_MB) status = 'degraded';
+    if (state.eventLoop.lagMs > THRESH.EL_CRIT_MS) status = 'degraded';
+
+    if (status !== 'ok' && _overallStatus === 'ok')  state.sla.lastDown = Date.now();
+    if (status === 'ok'  && _overallStatus !== 'ok' && state.sla.lastDown) {
+      state.sla.downtimeMs += Date.now() - state.sla.lastDown;
+      state.sla.lastDown    = null;
+    }
+    _overallStatus = status;
+    return status;
   }
 
-  function formatUptime(ms) { const s = Math.floor(ms / 1000); return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h ${Math.floor((s % 3600) / 60)}m ${s % 60}s`; }
+  function formatUptime(ms) {
+    const s = Math.floor(ms / 1000);
+    return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h ` +
+           `${Math.floor((s % 3600) / 60)}m ${s % 60}s`;
+  }
 
-  router.get('/', (req, res) => { const status = calcStatus(); res.status(status === 'down' ? 503 : 200).json({ status, version: VERSION, uptime: formatUptime(Date.now() - BOOT_TIME) }); });
-  router.get('/ready', (req, res) => { let ready = true; for (const [, c] of state.checks) if (c.status === 'error') { ready = false; break; } res.status(ready ? 200 : 503).json({ ready, ts: new Date().toISOString() }); });
-  router.get('/detailed', (req, res) => { res.json({ status: calcStatus(), version: VERSION, uptime: { ms: Date.now() - BOOT_TIME, human: formatUptime(Date.now() - BOOT_TIME) }, cpu: state.cpu, memory: state.memory, heap: state.heap, eventLoop: state.eventLoop, checks: Object.fromEntries(state.checks) }); });
+  function buildReport() {
+    const uptimeMs  = Date.now() - BOOT_TIME;
+    const slaUptime = uptimeMs > 0
+      ? ((1 - state.sla.downtimeMs / uptimeMs) * 100).toFixed(3)
+      : '100.000';
+
+    const checksObj = {};
+    for (const [name, c] of state.checks) checksObj[name] = c;
+
+    return {
+      status  : calcStatus(),
+      version : VERSION,
+      uptime  : { ms: uptimeMs, human: formatUptime(uptimeMs) },
+      sla     : { uptime: `${slaUptime}%`, downtimeMs: state.sla.downtimeMs },
+      ts      : new Date().toISOString(),
+      cpu     : {
+        current: `${state.cpu.current}%`,
+        avg5s  : `${state.cpu.avg5s}%`,
+        warn   : state.cpu.avg5s > THRESH.CPU_WARN,
+        cores  : (os.cpus() ||[]).length,
+        load   : os.loadavg().map(l => +l.toFixed(2)),
+      },
+      memory   : state.memory,
+      heap     : state.heap,
+      eventLoop: state.eventLoop,
+      node     : {
+        version : process.version,
+        pid     : process.pid,
+        platform: os.platform(),
+        arch    : os.arch(),
+        hostname: os.hostname(),
+      },
+      cache : {
+        l1: CacheManager.L1.info(),
+        l2: CacheManager.L2.info(),
+        metrics: CacheManager.metrics.snapshot(),
+      },
+      checks    : checksObj,
+      incidents : state.incidents.slice(-10),
+      thresholds: THRESH,
+    };
+  }
+
+  router.get('/', (req, res) => {
+    const status = calcStatus();
+    res.status(status === 'down' ? 503 : 200).json({
+      status,
+      version: VERSION,
+      uptime : formatUptime(Date.now() - BOOT_TIME),
+    });
+  });
+
+  router.get('/detailed', (req, res) => res.json(buildReport()));
+
+  router.get('/ready', (req, res) => {
+    let ready = true;
+    for (const [, c] of state.checks) if (c.status === 'error') { ready = false; break; }
+    res.status(ready ? 200 : 503).json({ ready, ts: new Date().toISOString() });
+  });
+
+  router.get('/metrics', (req, res) => {
+    const r = buildReport();
+    const lines =[
+      `# HELP bb_uptime_seconds Total server uptime\n# TYPE bb_uptime_seconds gauge\nbb_uptime_seconds ${Math.floor(r.uptime.ms / 1000)}`,
+      `# HELP bb_cpu_avg5s CPU 5s rolling average percent\n# TYPE bb_cpu_avg5s gauge\nbb_cpu_avg5s ${state.cpu.avg5s}`,
+      `# HELP bb_memory_pct System memory used percent\n# TYPE bb_memory_pct gauge\nbb_memory_pct ${state.memory.pct}`,
+      `# HELP bb_heap_used_mb Heap used MB\n# TYPE bb_heap_used_mb gauge\nbb_heap_used_mb ${state.heap.usedMB}`,
+      `# HELP bb_eventloop_lag_ms Event loop lag ms\n# TYPE bb_eventloop_lag_ms gauge\nbb_eventloop_lag_ms ${state.eventLoop.lagMs}`,
+      `# HELP bb_cache_hits Total cache hits\n# TYPE bb_cache_hits counter\nbb_cache_hits ${CacheManager.metrics.hits}`,
+      `# HELP bb_cache_misses Total cache misses\n# TYPE bb_cache_misses counter\nbb_cache_misses ${CacheManager.metrics.misses}`,
+      `# HELP bb_incidents_total Total health incidents\n# TYPE bb_incidents_total counter\nbb_incidents_total ${state.incidents.length}\n`,
+    ];
+    res.setHeader('Content-Type', 'text/plain; version=0.0.4');
+    res.send(lines.join('\n'));
+  });
 
   return router;
 })();
 
 
 // ═══════════════════════════════════════════════════════════════════
-//  7. EXPRESS APP SETUP
+//  7. EXPRESS APP SETUP & ORCHESTRATION
 // ═══════════════════════════════════════════════════════════════════
 
 const app        = express();
@@ -691,6 +1175,7 @@ const PORT       = parseInt(process.env.PORT || '3000', 10);
 const IS_PROD    = (process.env.NODE_ENV || 'production') === 'production';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
+// Trust proxy for Railway/Render environments
 app.set('trust proxy', 1);
 
 // Middleware Stack
@@ -703,7 +1188,7 @@ app.use(compression({
     return compression.filter(req, res);
   },
 }));
-app.use(requestLogger());
+app.use(Logger.requestLogger());
 
 // Static Files Serve
 app.use(express.static(PUBLIC_DIR, {
@@ -718,10 +1203,10 @@ app.use(express.static(PUBLIC_DIR, {
 app.use('/health', HealthMonitor);
 app.use('/api/v1', ApiProxy);
 app.use('/api/v1/cache', CacheManager.router);
-app.get('/api/v1/logs', logsHandler);
+app.get('/api/v1/logs', Logger.logsHandler);
 app.get('/api/v1/cors-stats', (req, res) => res.json(CorsConfig.getCorsStats()));
 
-// Catch-all SPA Route
+// Catch-all SPA Route for deep linking
 app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api/') || req.path.startsWith('/health')) return next();
   const indexFile = path.join(PUBLIC_DIR, 'index.html');
@@ -729,7 +1214,10 @@ app.get('*', (req, res, next) => {
 });
 
 // 404 & Global Error Handling
-app.use((req, res) => res.status(404).json({ error: 'not_found', message: `${req.method} ${req.path} does not exist`, ts: new Date().toISOString() }));
+app.use((req, res) => {
+  res.status(404).json({ error: 'not_found', message: `${req.method} ${req.path} does not exist`, ts: new Date().toISOString() });
+});
+
 app.use((err, req, res, next) => {
   const status  = err.status || err.statusCode || 500;
   const message = IS_PROD && status === 500 ? 'Internal server error' : err.message;
@@ -746,6 +1234,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     pid      : process.pid,
     node     : process.version,
   });
+
   if (!process.env.TMDB_API_KEY) {
     log.warn('TMDB_API_KEY not set — using fallback key. Set it in Railway env vars.');
   }
