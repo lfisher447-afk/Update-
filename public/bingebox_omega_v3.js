@@ -796,7 +796,7 @@ const Hero = {
       el.style.cssText = item.backdrop
          ? `background-image:linear-gradient(77deg,rgba(0,0,0,.9) 0%,rgba(0,0,0,.55) 45%,rgba(0,0,0,.15) 80%),url('${item.backdrop}');background-size:cover;background-position:center top;`
          : '';
-      const badge = el.querySelector('.hero-badge');
+      const badge = el.querySelector('#heroBadgeType');
       const match = el.querySelector('.hero-match');
       const title = el.querySelector('.hero-title');
       const desc  = el.querySelector('.hero-desc');
@@ -2942,22 +2942,16 @@ async function init() {
    if (AppState.settings.reducedMotion) document.documentElement.classList.add('reduced-motion');
    if (AppState.settings.autoTheme) _autoTheme();
 
+   /* Loader is hidden by the inline HTML failsafe script (window._hideLoader).
+      This local reference is used by the finally block below. */
    const hideLoader = () => {
-      const lo = document.getElementById('loaderOverlay');
-      if (lo) lo.classList.add('hidden');
-      clearInterval(countdownInterval);
+      if (typeof window._hideLoader === 'function') {
+         window._hideLoader(); /* clears HTML inline timers + hides overlay */
+      } else {
+         const lo = document.getElementById('loaderOverlay');
+         if (lo) lo.classList.add('hidden');
+      }
    };
-
-   /* FIX 7: 10s failsafe with live countdown + skip button */
-   let countdown = 10;
-   const failsafe = setTimeout(hideLoader, 10000);
-   const loaderOverlay = document.getElementById('loaderOverlay');
-   let countdownInterval;
-   if (loaderOverlay) {
-      const countdownEl = document.createElement('div');
-      countdownEl.id = 'loaderCountdown';
-      countdownEl.style.cssText = 'position:absolute;bottom:32px;left:50%;transform:translateX(-50%);text-align:center;color:#aaa;font-size:14px;z-index:100001;';
-      countdownEl.innerHTML = `<span id="loaderCountdownText">Loading… ${countdown}s</span><br><button id="loaderSkipBtn" style="margin-top:8px;padding:4px 16px;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:6px;cursor:pointer;font-size:13px;">✕ Skip</button>`;
       loaderOverlay.appendChild(countdownEl);
       document.getElementById('loaderSkipBtn')?.addEventListener('click', () => {
          clearTimeout(failsafe);
@@ -3056,6 +3050,16 @@ Object.assign(window, {
    showCategory, filterByGenre, goHome, loadMore, toggleInfiniteScroll,
    showToast, updateActiveNav, showContextMenu, buildGenrePills,
    openSettings, closeSettings, switchSettingsTab, toggleSetting, applyTheme,
+   saveSettings, exportData, importData, clearAllData, testHaptic,
+   showProfiles, selectProfile, promptAddProfile,
+   startVoiceSearch, activateKonami, scrollToHistory, shareMedia,
+   showKeyboardShortcuts,
+   PartyEngine, Navbar, Hero, Rows, Search, Achievements, TMDB, EventBus, State, AppState,
+});
+
+/* ── LAUNCH ─────────────────────────────────────────────────────────────────── */
+init();
+oggleSetting, applyTheme,
    saveSettings, exportData, importData, clearAllData, testHaptic,
    showProfiles, selectProfile, promptAddProfile,
    startVoiceSearch, activateKonami, scrollToHistory, shareMedia,
